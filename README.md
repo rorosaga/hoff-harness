@@ -47,7 +47,7 @@ few seconds, but stay attached for 15 minutes. To change the keys, ask your
 agent (*"use cmd+shift for marking"*); they live in
 `~/.config/hoff-harness/config.json`.
 
-### Works with
+## Works with
 
 | Agent | Point, guide, do | Marks attach to your message | Tested |
 |---|---|---|---|
