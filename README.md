@@ -1,3 +1,5 @@
+<img src="static/banner.jpg" alt="A sunlit, empty lecture hall with a blackboard" width="100%" />
+
 # hoff-harness
 
 A second cursor for your coding agent. It glides to things on your Mac, explains
