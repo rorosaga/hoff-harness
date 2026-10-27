@@ -65,7 +65,9 @@ INTERACTIVE = {
 
 
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
-CONFIG = os.path.join(SKILL_DIR, "config.json")
+BUNDLED = os.path.join(SKILL_DIR, "config.json")  # defaults that ship with this version
+HOME = os.path.expanduser("~/.config/hoff-harness")  # the person's own: survives plugin updates
+CONFIG = os.path.join(HOME, "config.json")
 DEFAULTS = {"dismiss": "ctrl+alt+escape", "mark": "ctrl+alt", "marks": True, "show_key_hint": False}
 
 # Keys are written like "ctrl+alt+escape" or "cmd+shift+h": modifiers, then one key.
@@ -139,8 +141,10 @@ def load_config() -> dict:
     with the reason in "error", so the guide never loses its way out."""
     conf = dict(DEFAULTS)
     try:
-        with open(CONFIG) as f:
-            conf.update(json.load(f))
+        for path in (BUNDLED, CONFIG):  # the person's file wins over the shipped one
+            if os.path.exists(path):
+                with open(path) as f:
+                    conf.update(json.load(f))
         conf["keys"] = {"dismiss": parse_keys(conf["dismiss"]), "mark": parse_modifiers(conf["mark"])}
     except FileNotFoundError:
         conf["keys"] = {"dismiss": parse_keys(DEFAULTS["dismiss"]), "mark": parse_modifiers(DEFAULTS["mark"])}
@@ -1527,7 +1531,7 @@ class Overlay:
     def config(self) -> dict:
         """config.json, read again whenever it changes: no restart needed."""
         with contextlib.suppress(OSError):
-            stamp = os.stat(CONFIG).st_mtime
+            stamp = max((os.stat(p).st_mtime for p in (BUNDLED, CONFIG) if os.path.exists(p)), default=0)
             if stamp != self.conf_stamp:
                 self.conf, self.conf_stamp = load_config(), stamp
                 write_keys_hint(self.conf)
@@ -2045,7 +2049,16 @@ def cmd_doctor() -> int:
     return 0 if ok else 1
 
 
-STATUSLINE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "statusline.sh")
+SHIPPED_STATUSLINE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "statusline.sh")
+STATUSLINE = os.path.join(HOME, "statusline.sh")  # a stable copy: plugin updates move the shipped one
+
+
+def refresh_statusline() -> None:
+    """Keep the stable copy current with this version (on install and every session start)."""
+    with contextlib.suppress(OSError):
+        os.makedirs(HOME, exist_ok=True)
+        shutil.copyfile(SHIPPED_STATUSLINE, STATUSLINE)
+        os.chmod(STATUSLINE, 0o755)
 SETTINGS = os.path.expanduser("~/.claude/settings.json")
 
 
@@ -2059,6 +2072,7 @@ def cmd_statusline(action: str) -> None:
         print(f"status line: {'hoff-harness clip counter' if ours else (current or 'none')}")
         return
     if action == "install":
+        refresh_statusline()
         if current and not ours:
             die("You already have a status line:\n  " + current + "\nAdd this line's output to it instead:\n  "
                 + f'"{STATUSLINE}"', 10)
@@ -2188,6 +2202,8 @@ def main() -> None:
             die("Not connected. Run `browser-harness --doctor`.", 9)
         print(f"connected: {len(got)} Chrome tabs")
     elif a.cmd == "start":
+        if os.path.exists(STATUSLINE):
+            refresh_statusline()
         if not send({"cmd": "status"}):  # nobody answered: start one
             spawn()
     elif a.cmd == "context":
@@ -2196,7 +2212,7 @@ def main() -> None:
         conf = load_config()
         if conf.get("error"):
             die(f"config.json is broken, the defaults are in use: {conf['error']}", 6)
-        print(f"config: {CONFIG}")
+        print(f"config: {CONFIG}{'' if os.path.exists(CONFIG) else '  (not created yet: the defaults are in use)'}")
         print(f"dismiss  {conf['dismiss']:<20} {conf['keys']['dismiss'][2]}")
         print(f"mark     {conf['mark']:<20} {conf['keys']['mark'][1]}  (hold, then click or drag){'' if conf['marks'] else '  [marks off]'}")
         print(f"show_key_hint  {conf['show_key_hint']}")

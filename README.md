@@ -35,14 +35,14 @@ other agents that can run shell commands.
 Send your message and the marks go with it. Marks fade from the screen after a
 few seconds, but stay attached for 15 minutes. To change the keys, ask your
 agent (*"use cmd+shift for marking"*); they live in
-[`config.json`](skills/hoff-harness/config.json).
+`~/.config/hoff-harness/config.json`.
 
 ## Install
 
 Paste this into Claude Code:
 
 ```text
-Install hoff-harness from https://github.com/rorosaga/hoff-harness: run `claude plugin marketplace add rorosaga/hoff-harness` and `claude plugin install hoff-harness@hoff-harness`. Make sure `uv` is installed. Then run the plugin's `skills/hoff-harness/scripts/hoff-harness doctor`, explain any missing macOS permission and ask before requesting it. Offer to add the clip counter to my status line with `hoff-harness statusline install`. If browser-harness is installed, run `hoff-harness browser` to connect Chrome. Finally point at something in Finder: `hoff-harness point --app Finder --find "Go" --say "Hi, I'm your guide cursor."`
+Install hoff-harness from https://github.com/rorosaga/hoff-harness: run `claude plugin marketplace add rorosaga/hoff-harness` and `claude plugin install hoff-harness@hoff-harness`. Make sure `uv` is installed. Then run `doctor` with the plugin's script (`~/.claude/plugins/cache/hoff-harness/hoff-harness/*/skills/hoff-harness/scripts/hoff-harness doctor`), explain any missing macOS permission and ask before requesting it. Offer to add the clip counter to my status line with `hoff-harness statusline install`. If browser-harness is installed, run `hoff-harness browser` to connect Chrome. Finally point at something in Finder: `hoff-harness point --app Finder --find "Go" --say "Hi, I'm your guide cursor."`
 ```
 
 Other agents and manual setup: [install.md](install.md).

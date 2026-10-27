@@ -105,6 +105,11 @@ one pixel per point and prints the origin to add.
 
 ## Config
 
+The person's settings are `~/.config/hoff-harness/config.json`, over the defaults in
+`skills/hoff-harness/config.json`: a plugin update replaces the versioned plugin folder,
+so nothing the person changes may live there. For the same reason `statusline install`
+points Claude Code at a copy in `~/.config/hoff-harness/`, refreshed on every `start`.
+
 `config.json`:
 
 ```json

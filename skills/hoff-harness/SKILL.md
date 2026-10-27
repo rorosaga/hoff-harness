@@ -162,7 +162,9 @@ Waiting clips show in Claude Code's status line
 
 ## Changing the keys
 
-When the person wants different keys, edit `${CLAUDE_SKILL_DIR}/config.json`:
+When the person wants different keys, edit `~/.config/hoff-harness/config.json`
+(create it with only the settings that change; it survives plugin updates, and
+`${CLAUDE_SKILL_DIR}/config.json` holds the defaults):
 
 ```json
 { "dismiss": "ctrl+alt+escape", "mark": "ctrl+alt", "marks": true, "show_key_hint": false }

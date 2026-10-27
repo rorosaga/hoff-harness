@@ -73,7 +73,7 @@ Every line says what works, and for what doesn't, exactly what to do.
 
 ## Keys
 
-In `skills/hoff-harness/config.json`:
+In `~/.config/hoff-harness/config.json` (only what you change; the defaults ship in `skills/hoff-harness/config.json`):
 
 ```json
 { "dismiss": "ctrl+alt+escape", "mark": "ctrl+alt", "marks": true, "show_key_hint": false }
