@@ -1,0 +1,13 @@
+name: check
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python compiles
+        run: python3 -c "compile(open('skills/hoff-harness/scripts/hoff-harness').read(), 'hoff-harness', 'exec'); compile(open('skills/hoff-harness/scripts/pointer.py').read(), 'pointer.py', 'exec')"
+      - name: Status line script parses
+        run: sh -n skills/hoff-harness/scripts/statusline.sh
+      - name: JSON is valid
+        run: for f in .claude-plugin/*.json hooks/hooks.json skills/hoff-harness/config.json; do python3 -m json.tool "$f" > /dev/null || exit 1; done

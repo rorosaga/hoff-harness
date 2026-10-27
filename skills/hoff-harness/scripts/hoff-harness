@@ -1,0 +1,2208 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "pyobjc-framework-Cocoa",
+#   "pyobjc-framework-Quartz",
+#   "pyobjc-framework-ApplicationServices",
+# ]
+# ///
+"""hoff-harness: a second cursor an agent drives, with a speech bubble.
+
+The CLI side finds things (accessibility tree, screenshots) and sends one
+command per call to the overlay process. The overlay process draws the cursor,
+the bubble and the target ring in click-through windows above everything, and
+exits on its own after a while with nothing to show.
+
+Coordinates are screen points with the origin at the top-left of the main
+display, the same space the accessibility API and Quartz window bounds use.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+import AppKit
+import ApplicationServices as AX
+import CoreFoundation as CF
+import Quartz
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import pointer as P  # noqa: E402  vendored unchanged from macos-harness (MIT): the shape and the motion
+
+STATE = os.path.expanduser("~/Library/Caches/hoff-harness")
+SOCK = os.path.join(STATE, "overlay.sock")
+LOCK = os.path.join(STATE, "overlay.lock")
+LOG = os.path.join(STATE, "overlay.log")
+
+ACCENT = (58 / 255, 118 / 255, 240 / 255)  # the ring and the marks: a blue that reads on light and dark
+TITLE_BLUE = (150 / 255, 190 / 255, 255 / 255)  # the step title, on the dark glass
+TINT_BLUE = (16 / 255, 30 / 255, 68 / 255)  # laid over the frosted glass of the bubble
+OK = (52 / 255, 199 / 255, 89 / 255)  # the ring once the person clicked it
+BUBBLE_MAX_W = 340.0
+BUBBLE_PAD = (14.0, 11.0)
+REVEAL_CPS = 110.0  # characters per second the bubble text types in at
+FADE = 0.22
+IDLE_HIDDEN = 600.0  # seconds hidden until the overlay process exits
+IDLE_SHOWN = 1800.0  # seconds without a command until it hides itself
+INTERACTIVE = {
+    "AXButton", "AXMenuItem", "AXMenuBarItem", "AXCheckBox", "AXRadioButton",
+    "AXPopUpButton", "AXMenuButton", "AXTextField", "AXTextArea", "AXSearchField",
+    "AXComboBox", "AXLink", "AXTab", "AXTabGroup", "AXSlider", "AXDisclosureTriangle",
+    "AXIncrementor", "AXCell", "AXRow", "AXDockItem", "AXSegmentedControl",
+}
+
+
+SKILL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+CONFIG = os.path.join(SKILL_DIR, "config.json")
+DEFAULTS = {"dismiss": "ctrl+alt+escape", "mark": "ctrl+alt", "marks": True, "show_key_hint": False}
+
+# Keys are written like "ctrl+alt+escape" or "cmd+shift+h": modifiers, then one key.
+MODIFIERS = {
+    "cmd": (AppKit.NSEventModifierFlagCommand, "⌘"), "command": (AppKit.NSEventModifierFlagCommand, "⌘"),
+    "ctrl": (AppKit.NSEventModifierFlagControl, "⌃"), "control": (AppKit.NSEventModifierFlagControl, "⌃"),
+    "alt": (AppKit.NSEventModifierFlagOption, "⌥"), "option": (AppKit.NSEventModifierFlagOption, "⌥"),
+    "opt": (AppKit.NSEventModifierFlagOption, "⌥"), "shift": (AppKit.NSEventModifierFlagShift, "⇧"),
+}
+MODIFIER_MASK = (AppKit.NSEventModifierFlagCommand | AppKit.NSEventModifierFlagControl
+                 | AppKit.NSEventModifierFlagOption | AppKit.NSEventModifierFlagShift)
+# macOS virtual key codes (ANSI layout) and how each key is printed in the hint.
+KEYS = {
+    "escape": (53, "esc"), "esc": (53, "esc"), "return": (36, "↩"), "enter": (36, "↩"), "tab": (48, "⇥"),
+    "space": (49, "Space"), "delete": (51, "⌫"), "backspace": (51, "⌫"), "forwarddelete": (117, "⌦"),
+    "left": (123, "←"), "right": (124, "→"), "down": (125, "↓"), "up": (126, "↑"),
+    "home": (115, "↖"), "end": (119, "↘"), "pageup": (116, "⇞"), "pagedown": (121, "⇟"),
+    "minus": (27, "-"), "equal": (24, "="), "comma": (43, ","), "period": (47, "."), "slash": (44, "/"),
+    "semicolon": (41, ";"), "quote": (39, "'"), "backslash": (42, "\\"), "grave": (50, "`"),
+    "leftbracket": (33, "["), "rightbracket": (30, "]"),
+    **{c: (k, c.upper()) for c, k in zip("asdfhgzxcvbqweryt", (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17))},
+    **{c: (k, c.upper()) for c, k in zip("oupiljkmn", (31, 32, 35, 34, 37, 38, 40, 46, 45))},
+    **{d: (k, d) for d, k in zip("1234567890", (18, 19, 20, 21, 23, 22, 26, 28, 25, 29))},
+    **{f"f{n}": (k, f"F{n}") for n, k in zip(range(1, 13), (122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111))},
+}
+
+
+def parse_modifiers(spec: str) -> tuple[int, str]:
+    """"ctrl+alt" -> (modifier flags, "⌃⌥"): a binding of modifiers only, held down."""
+    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
+    bad = [m for m in parts if m not in MODIFIERS]
+    if not parts or bad:
+        raise ValueError(f"{spec!r}: only modifiers (cmd, ctrl, alt, shift), like 'ctrl+alt'")
+    flags = 0
+    for m in parts:
+        flags |= MODIFIERS[m][0]
+    symbols = "".join(MODIFIERS[m][1] for m in parts)
+    return flags, "".join(c for c in "⌃⌥⇧⌘" if c in symbols)
+
+
+def parse_keys(spec: str) -> tuple[int, int, str]:
+    """"ctrl+alt+escape" -> (modifier flags, key code, "⌃⌥⎋"). Raises ValueError."""
+    parts = [p.strip().lower() for p in spec.split("+") if p.strip()]
+    if not parts or parts[-1] not in KEYS:
+        raise ValueError(f"{spec!r}: the last part must be a key, one of: {', '.join(sorted(KEYS))}")
+    flags, symbols = 0, ""
+    for m in parts[:-1]:
+        if m not in MODIFIERS:
+            raise ValueError(f"{spec!r}: {m!r} is not a modifier (cmd, ctrl, alt, shift)")
+        flags |= MODIFIERS[m][0]
+        symbols += MODIFIERS[m][1]
+    # Printed in the order macOS menus use: ⌃⌥⇧⌘.
+    symbols = "".join(c for c in "⌃⌥⇧⌘" if c in symbols)
+    code, name = KEYS[parts[-1]]
+    gap = " " if symbols and len(name) > 1 and name.isalpha() else ""  # ⌃⌥ esc, ⌘ Space; ⌃⌥Q
+    return flags, code, symbols + gap + name
+
+
+KEYS_HINT = os.path.join(STATE, "keys-hint")  # read by statusline.sh
+
+
+def write_keys_hint(conf: dict) -> None:
+    with contextlib.suppress(OSError):
+        os.makedirs(STATE, exist_ok=True)
+        with open(KEYS_HINT, "w") as f:
+            f.write(f"{conf['keys']['mark'][1]} add · {conf['keys']['dismiss'][2]} clear")
+
+
+def load_config() -> dict:
+    """config.json over the defaults. A broken file falls back to the defaults,
+    with the reason in "error", so the guide never loses its way out."""
+    conf = dict(DEFAULTS)
+    try:
+        with open(CONFIG) as f:
+            conf.update(json.load(f))
+        conf["keys"] = {"dismiss": parse_keys(conf["dismiss"]), "mark": parse_modifiers(conf["mark"])}
+    except FileNotFoundError:
+        conf["keys"] = {"dismiss": parse_keys(DEFAULTS["dismiss"]), "mark": parse_modifiers(DEFAULTS["mark"])}
+    except (ValueError, TypeError, AttributeError) as e:
+        conf = dict(DEFAULTS, error=str(e))
+        conf["keys"] = {"dismiss": parse_keys(DEFAULTS["dismiss"]), "mark": parse_modifiers(DEFAULTS["mark"])}
+    return conf
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# --- screens ------------------------------------------------------------------
+
+
+def screens() -> list[tuple[float, float, float, float]]:
+    """Each display as (x, y, w, h) in top-left global points, main display first."""
+    shots = AppKit.NSScreen.screens()
+    main_h = shots[0].frame().size.height
+    out = []
+    for s in shots:
+        f = s.frame()
+        out.append((f.origin.x, main_h - (f.origin.y + f.size.height), f.size.width, f.size.height))
+    return out
+
+
+def screen_of(x: float, y: float) -> tuple[float, float, float, float]:
+    all_ = screens()
+    for s in all_:
+        if s[0] <= x < s[0] + s[2] and s[1] <= y < s[1] + s[3]:
+            return s
+    return min(all_, key=lambda s: math.dist((x, y), (s[0] + s[2] / 2, s[1] + s[3] / 2)))
+
+
+def span(*points) -> tuple[float, float, float, float]:
+    """(left, top, right, bottom) of the displays these points are on."""
+    all_ = screens()
+    on = [s for s in all_ if any(s[0] <= x < s[0] + s[2] and s[1] <= y < s[1] + s[3] for x, y in points)] or all_
+    return (min(s[0] for s in on), min(s[1] for s in on),
+            max(s[0] + s[2] for s in on), max(s[1] + s[3] for s in on))
+
+
+def mouse() -> tuple[float, float]:
+    p = AppKit.NSEvent.mouseLocation()
+    return p.x, AppKit.NSScreen.screens()[0].frame().size.height - p.y
+
+
+# --- accessibility --------------------------------------------------------------
+
+ATTRS = [
+    "AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXValue", "AXIdentifier",
+    "AXHelp", "AXPlaceholderValue", "AXRoleDescription", "AXPosition", "AXSize", "AXChildren",
+]
+
+
+def running_app(name: str):
+    apps = AppKit.NSWorkspace.sharedWorkspace().runningApplications()
+    want = name.lower()
+    exact = [a for a in apps if (a.localizedName() or "").lower() == want or (a.bundleIdentifier() or "").lower() == want]
+    loose = [a for a in apps if want in (a.localizedName() or "").lower()]
+    found = exact or loose
+    if not found:
+        die(f"No running app called {name!r}. Open it first, or check the name.")
+    return found[0]
+
+
+def _value(v, kind):
+    if type(v).__name__ != "AXValueRef" or AX.AXValueGetType(v) != kind:
+        return None
+    ok, out = AX.AXValueGetValue(v, kind, None)
+    return out if ok else None
+
+
+def elements(pid: int, budget: float = 3.0, cap: int = 8000) -> list[dict]:
+    """Every element of the app that has a place on screen, breadth first."""
+    app = AX.AXUIElementCreateApplication(pid)
+    AX.AXUIElementSetMessagingTimeout(app, 1.0)
+    # Chrome and Electron apps build their tree only when asked for it.
+    AX.AXUIElementSetAttributeValue(app, "AXManualAccessibility", True)
+    AX.AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface", True)
+    shown = screens()
+    # What the person is looking at first: the focused window and the menu bar,
+    # then the rest of the app (other windows, sheets, popovers).
+    roots = []
+    for attr in ("AXFocusedWindow", "AXMenuBar"):
+        err, el = AX.AXUIElementCopyAttributeValue(app, attr, None)
+        if not err and el is not None:
+            roots.append(el)
+    err, kids = AX.AXUIElementCopyAttributeValue(app, "AXChildren", None)
+    seen: dict[int, list] = {}  # the tree can reach one element twice, or loop
+
+    def first_visit(el) -> bool:
+        bucket = seen.setdefault(CF.CFHash(el), [])
+        if any(CF.CFEqual(el, other) for other in bucket):
+            return False
+        bucket.append(el)
+        return True
+
+    roots += list(kids or [])
+    queue, out, start = [(r, 1) for r in roots], [], time.monotonic()
+    while queue and len(out) < cap and time.monotonic() - start < budget:
+        el, depth = queue.pop(0)
+        if not first_visit(el):
+            continue
+        err, vals = AX.AXUIElementCopyMultipleAttributeValues(el, ATTRS, 0, None)
+        if err or not vals:
+            continue
+        got = dict(zip(ATTRS, vals))
+        text = {k: got[k] for k in ATTRS[:9] if isinstance(got[k], str) and got[k].strip()}
+        if text.get("AXIdentifier", "").startswith("_"):
+            del text["AXIdentifier"]  # internal (_NS:122, _SC_SEARCH_FIELD): means nothing to the person
+        pos = _value(got["AXPosition"], AX.kAXValueCGPointType)
+        size = _value(got["AXSize"], AX.kAXValueCGSizeType)
+        if pos is not None and size is not None and size.width > 1 and size.height > 1:
+            rect = (pos.x, pos.y, size.width, size.height)
+            if not any(rect[0] < s[0] + s[2] and rect[0] + rect[2] > s[0] and rect[1] < s[1] + s[3] and rect[1] + rect[3] > s[1] for s in shown):
+                continue  # scrolled away or on no screen: so is everything inside it
+            seen_area = sum(max(0.0, min(rect[0] + rect[2], s[0] + s[2]) - max(rect[0], s[0]))
+                            * max(0.0, min(rect[1] + rect[3], s[1] + s[3]) - max(rect[1], s[1])) for s in shown)
+            if seen_area >= 0.5 * rect[2] * rect[3]:  # mostly on a screen: worth pointing at
+                out.append({"role": text.get("AXRole", "?"), "text": text, "rect": rect, "depth": depth, "el": el})
+        kids = got["AXChildren"]
+        if isinstance(kids, (list, tuple)) or type(kids).__name__.startswith("__NSArray"):
+            queue.extend((k, depth + 1) for k in kids)
+    return out
+
+
+def label(e: dict) -> str:
+    t = e["text"]
+    for k in ("AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue", "AXHelp", "AXIdentifier"):
+        if k in t:
+            return " ".join(t[k].split())[:70]
+    return ""
+
+
+def score(e: dict, query: str) -> float:
+    q = query.lower().strip()
+    best = 0.0
+    for k, v in e["text"].items():
+        if k == "AXRole":
+            continue
+        v = " ".join(v.lower().split())
+        weight = 0.6 if k in ("AXValue", "AXHelp", "AXRoleDescription") else 1.0
+        if v == q:
+            s = 100
+        elif v.startswith(q):
+            s = 70
+        elif f" {q}" in f" {v}":
+            s = 50
+        elif q in v:
+            s = 30
+        else:
+            continue
+        best = max(best, s * weight)
+    if best and e["role"] in INTERACTIVE:
+        best += 12
+    return best
+
+
+def find(app_name: str, query: str | None, role: str | None = None) -> tuple[object, list[dict]]:
+    app = running_app(app_name)
+    els = elements(app.processIdentifier())
+    if role:
+        els = [e for e in els if role.lower() in e["role"].lower()]
+    if query:
+        scored = [(score(e, query), e) for e in els]
+        hits = [e for s, e in sorted(scored, key=lambda t: -t[0]) if s > 0]
+    else:
+        hits = [e for e in els if e["role"] in INTERACTIVE and label(e)]
+    # What the person can see first: hit-test the best few, keep the order otherwise.
+    pid = app.processIdentifier()
+    for e in hits[:25]:
+        x, y, w, h = e["rect"]
+        e["covered"] = owner_at(x + w / 2, y + h / 2) not in (None, pid)
+    best = {id(e): score(e, query) if query else 0 for e in hits[:25]}
+    hits[:25] = sorted(hits[:25], key=lambda e: (-best[id(e)], e["covered"], e["rect"][2] * e["rect"][3]))
+    return app, hits
+
+
+def owner_at(x: float, y: float) -> int | None:
+    """The pid of the app whose element is on top at this point."""
+    err, el = AX.AXUIElementCopyElementAtPosition(AX.AXUIElementCreateSystemWide(), x, y, None)
+    if err or el is None:
+        return None
+    err, pid = AX.AXUIElementGetPid(el, None)
+    return None if err else pid
+
+
+def show_hits(app, hits: list[dict], limit: int) -> None:
+    front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    is_front = front and front.processIdentifier() == app.processIdentifier()
+    print(f"{app.localizedName()} ({'frontmost' if is_front else 'NOT frontmost: it may be covered'})")
+    if not hits:
+        print("No matching element. Try another word, no query to list controls, or `hoff-harness shot`.")
+    for i, e in enumerate(hits[:limit]):
+        x, y, w, h = (round(v) for v in e["rect"])
+        print(f"[{i}] {e['role'][2:]:<14} {label(e)!r:<44} @ {x},{y} {w}x{h}{'  (covered)' if e.get('covered') else ''}")
+    if len(hits) > limit:
+        print(f"... {len(hits) - limit} more")
+
+
+# --- talking to the overlay ---------------------------------------------------
+
+
+def send(msg: dict) -> dict:
+    data = json.dumps(msg).encode()
+    started = False
+    deadline = time.monotonic() + 8
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(3)
+                s.connect(SOCK)
+                s.sendall(data)
+                s.shutdown(socket.SHUT_WR)
+                reply = b"".join(iter(lambda: s.recv(65536), b""))
+                return json.loads(reply or b"{}")
+        except (FileNotFoundError, ConnectionRefusedError):
+            if msg["cmd"] in ("hide", "quit", "status"):
+                return {}
+            if not started:
+                spawn()
+                started = True
+            if time.monotonic() > deadline:
+                die(f"The overlay did not start. See {LOG}")
+            time.sleep(0.05)
+
+
+def spawn() -> None:
+    os.makedirs(STATE, exist_ok=True)
+    with open(LOG, "a") as log:
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "_serve"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+        )
+
+
+# --- the overlay process --------------------------------------------------------
+
+
+def last_place() -> tuple[float, float] | None:
+    """Where the cursor last pointed, so a restarted overlay picks up there."""
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        with open(os.path.join(STATE, "place.json")) as f:
+            x, y = json.load(f)
+            return float(x), float(y)
+    return None
+
+
+def remember_place(at: tuple[float, float]) -> None:
+    with contextlib.suppress(OSError):
+        with open(os.path.join(STATE, "place.json"), "w") as f:
+            json.dump([round(at[0], 1), round(at[1], 1)], f)
+
+
+def ease(u: float) -> float:
+    u = max(0.0, min(1.0, u))
+    return 4 * u**3 if u < 0.5 else 1 - (-2 * u + 2) ** 3 / 2
+
+
+class Scene:
+    """What is drawn, as a function of the commands so far and the clock."""
+
+    def __init__(self) -> None:
+        here = last_place() or mouse()
+        self.move = P.plan(here, here, span(here))  # the running move
+        self.began = 0.0  # when it started
+        self.shown = False
+        self.shown_at = 0.0
+        self.fade = (0.0, 0.0, 0.0)  # (from alpha, to alpha, start)
+        self.pulses: list[float] = []  # when each press pulse starts
+        self.bubble = None  # {"title", "text", "start", "until"}
+        self.ring = None  # {"rect", "start", "ok", "until"}
+        self.touched = time.monotonic()
+
+    def alpha(self, now: float) -> float:
+        a, b, t0 = self.fade
+        return a + (b - a) * min(1.0, (now - t0) / FADE)
+
+    def pose(self, now: float) -> tuple[float, ...]:
+        return P.pose(self.move, now - self.began)
+
+    def cursor(self, now: float) -> tuple[float, float]:
+        return self.pose(now)[:2]
+
+    def press(self, now: float) -> float:
+        return min((P.press_scale(now - at) for at in self.pulses), default=1.0)
+
+    def busy(self, now: float) -> bool:
+        if now - self.fade[2] < FADE:
+            return True
+        if now - self.began < self.move["duration"]:
+            return True
+        if any(now - at < P.PRESS[-1][0] for at in self.pulses):
+            return True
+        if self.bubble and now - self.bubble["start"] < len(self.bubble["text"]) / REVEAL_CPS + 0.2:
+            return True
+        return bool(self.ring) and self.shown
+
+    def go(self, to: tuple[float, float], now: float, calm: bool) -> None:
+        here = self.cursor(now) if self.shown else mouse()  # it comes out of the person's own pointer
+        bounds = span(here, to)
+        to = (P.clamp(to[0], bounds[0], bounds[2]), P.clamp(to[1], bounds[1], bounds[3]))
+        if math.dist(self.move["end"], to) >= P.STILL or not self.shown:
+            self.move, self.began = P.plan(to if calm else here, to, bounds), now
+        remember_place(to)
+
+    def show(self, now: float, moving: bool) -> None:
+        """Fade in. On its way somewhere, it comes out of the person's own pointer;
+        only talking, it comes back where it last pointed."""
+        if not self.shown:
+            if moving:
+                self.go(mouse(), now, calm=True)
+            self.shown, self.shown_at = True, now
+            self.fade = (self.alpha(now), 1.0, now)
+
+    def hide(self, now: float) -> None:
+        if self.shown:
+            self.shown = False
+            self.fade = (self.alpha(now), 0.0, now)
+        self.bubble = self.ring = None
+
+    def command(self, c: dict, now: float, calm: bool = False) -> dict:
+        self.touched = now
+        cmd = c["cmd"]
+        if cmd == "hide":
+            self.hide(now)
+        elif cmd == "ok":
+            self.pulses = [max(now, self.began + self.move["arrive"])]
+            if self.ring:
+                self.ring.update(ok=now, until=now + 0.6)
+        elif cmd == "show":
+            self.show(now, moving="x" in c)
+            if "x" in c:
+                self.go((float(c["x"]), float(c["y"])), now, calm)
+            if "rect" in c:
+                self.ring = {"rect": c["rect"], "start": now, "ok": None, "until": None} if c["rect"] else None
+            if "text" in c:
+                if c["text"]:
+                    hold = c.get("for")
+                    self.bubble = {"title": c.get("title") or "", "text": c["text"], "start": now,
+                                   "until": now + hold if hold else None, "hint": c.get("hint", "")}
+                else:
+                    self.bubble = None
+        x, y = self.move["end"]
+        arrive = max(0.0, self.began + self.move["arrive"] - now)
+        return {"ok": True, "cursor": [round(x), round(y)], "arrive_in": round(arrive, 3), "shown": self.shown}
+
+    def tick(self, now: float) -> None:
+        if self.bubble and self.bubble["until"] and now > self.bubble["until"]:
+            self.bubble = None
+        if self.ring and self.ring["until"] and now > self.ring["until"]:
+            self.ring = None
+        if self.shown and now - self.touched > IDLE_SHOWN:
+            self.hide(now)
+
+
+def _rgba(rgb, a):
+    return AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(rgb[0], rgb[1], rgb[2], a)
+
+
+def _shadow(blur, alpha, dy=2.0):
+    sh = AppKit.NSShadow.alloc().init()
+    sh.setShadowBlurRadius_(blur)
+    sh.setShadowOffset_((0, -dy))
+    sh.setShadowColor_(AppKit.NSColor.colorWithWhite_alpha_(0, alpha))
+    return sh
+
+
+def bubble_text(title: str, text: str, upto: int | None = None):
+    para = AppKit.NSMutableParagraphStyle.alloc().init()
+    para.setLineSpacing_(2.0)
+    out = AppKit.NSMutableAttributedString.alloc().init()
+    if title:
+        out.appendAttributedString_(AppKit.NSAttributedString.alloc().initWithString_attributes_(
+            title + "\n",
+            {AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(11.5, AppKit.NSFontWeightSemibold),
+             AppKit.NSForegroundColorAttributeName: _rgba(TITLE_BLUE, 1.0),
+             AppKit.NSParagraphStyleAttributeName: para}))
+    body = text if upto is None else text[:upto]
+    out.appendAttributedString_(AppKit.NSAttributedString.alloc().initWithString_attributes_(
+        body,
+        {AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(14.0, AppKit.NSFontWeightRegular),
+         AppKit.NSForegroundColorAttributeName: AppKit.NSColor.colorWithWhite_alpha_(1.0, 0.94),
+         AppKit.NSParagraphStyleAttributeName: para}))
+    return out
+
+
+_sizes: dict = {}
+HINT_GAP = 6.0
+
+
+def hint_text(hint: str):
+    para = AppKit.NSMutableParagraphStyle.alloc().init()
+    para.setAlignment_(AppKit.NSTextAlignmentRight)
+    return AppKit.NSAttributedString.alloc().initWithString_attributes_(
+        hint,
+        {AppKit.NSFontAttributeName: AppKit.NSFont.systemFontOfSize_weight_(9.5, AppKit.NSFontWeightMedium),
+         AppKit.NSForegroundColorAttributeName: AppKit.NSColor.colorWithWhite_alpha_(1.0, 0.38),
+         AppKit.NSParagraphStyleAttributeName: para})
+
+
+def measure(attributed) -> tuple[float, float]:
+    r = attributed.boundingRectWithSize_options_((BUBBLE_MAX_W, 10000), AppKit.NSStringDrawingUsesLineFragmentOrigin)
+    return math.ceil(r.size.width), math.ceil(r.size.height)
+
+
+def bubble_rect(b: dict, cx: float, cy: float) -> tuple[float, float, float, float]:
+    """Below and to the right of the cursor tip, flipped to stay on its screen."""
+    key = (b["title"], b["text"], b.get("hint", ""))
+    if key not in _sizes:
+        tw, th = measure(bubble_text(b["title"], b["text"]))
+        hw, hh = measure(hint_text(key[2])) if key[2] else (0, -HINT_GAP)
+        _sizes[key] = (max(tw, hw), th, hh + HINT_GAP)
+    tw, th, extra = _sizes[key]
+    w, h = tw + 2 * BUBBLE_PAD[0], th + extra + 2 * BUBBLE_PAD[1]
+    sx, sy, sw, sh = screen_of(cx, cy)
+    x, y = cx + 18, cy + 22
+    if x + w > sx + sw - 8:
+        x = cx - 12 - w
+    if y + h > sy + sh - 8:
+        y = cy - 12 - h
+    return max(sx + 8, x), max(sy + 8, y), w, h
+
+
+BUBBLE_RADIUS = 14.0
+POINTER_SIZE = 112.0  # the pointer's window, in points; the click point is its centre
+SHOW_BLUR = 7.0  # the pointer sharpens from this blur as it fades in
+
+
+def draw_pointer(at, shape=P.REST, press: float = 1.0, *, cover_only: bool = False, fill: float = P.FILL) -> None:
+    # Adapted from macos-harness overlay.py (MIT); see THIRD_PARTY.md.
+    """The macos-harness pointer, into the current flipped context, click point at `at`.
+    Seen = paint x cover. Paint: the fog tint, the arrow fill, the rim. Cover: 1
+    inside the arrow, the fog around it. `cover_only` draws the mask of the glass."""
+    context = AppKit.NSGraphicsContext.currentContext()
+    cg = context.CGContext()
+    context.saveGraphicsState()
+    a, sx, sy, b = shape
+    t = AppKit.NSAffineTransform.transform()
+    t.translateXBy_yBy_(at[0] + P.PIVOT[0], at[1] + P.PIVOT[1])
+    t.rotateByDegrees_(a)
+    t.scaleXBy_yBy_(sx, sy)
+    t.rotateByDegrees_(b)
+    t.translateXBy_yBy_(P.PRESS_ANCHOR[0] - P.PIVOT[0], P.PRESS_ANCHOR[1] - P.PIVOT[1])
+    t.scaleBy_(press)
+    t.translateXBy_yBy_(-P.PRESS_ANCHOR[0], -P.PRESS_ANCHOR[1])
+    t.concat()
+    white, outline = AppKit.NSColor.whiteColor(), P.outline_points()
+    arrow = AppKit.NSBezierPath.bezierPath()
+    arrow.appendBezierPathWithPoints_count_(outline, len(outline))
+    arrow.closePath()
+    layers = 0 if cover_only else 2
+    if layers:
+        disc = ((-P.FOG_RADIUS, -P.FOG_RADIUS), (2 * P.FOG_RADIUS, 2 * P.FOG_RADIUS))
+        Quartz.CGContextBeginTransparencyLayer(cg, None)
+        AppKit.NSColor.blackColor().colorWithAlphaComponent_(P.TINT).set()
+        AppKit.NSBezierPath.bezierPathWithOvalInRect_(disc).fill()
+        white.colorWithAlphaComponent_(fill).set()
+        arrow.fill()
+        white.colorWithAlphaComponent_(P.RIM).set()
+        arrow.setLineWidth_(P.RIM_WIDTH)
+        arrow.setMiterLimit_(10)
+        arrow.stroke()
+        Quartz.CGContextSetBlendMode(cg, Quartz.kCGBlendModeDestinationIn)  # paint only where the cover is
+        Quartz.CGContextBeginTransparencyLayer(cg, None)
+    fog = AppKit.NSGradient.alloc().initWithColors_atLocations_colorSpace_(
+        [white.colorWithAlphaComponent_(alpha) for _, alpha in P.FOG],
+        [radius / P.FOG_RADIUS for radius, _ in P.FOG],
+        AppKit.NSColorSpace.sRGBColorSpace())
+    fog.drawFromCenter_radius_toCenter_radius_options_((0, 0), 0, (0, 0), P.FOG_RADIUS, 0)
+    white.set()
+    arrow.fill()
+    for _ in range(layers):
+        Quartz.CGContextEndTransparencyLayer(cg)
+    context.restoreGraphicsState()
+
+
+def pointer_image(shape, press: float, *, cover_only: bool = False):
+    # Adapted from macos-harness overlay.py (MIT); see THIRD_PARTY.md.
+    def draw(_rect) -> bool:
+        draw_pointer((POINTER_SIZE / 2, POINTER_SIZE / 2), shape, press, cover_only=cover_only)
+        return True
+
+    return AppKit.NSImage.imageWithSize_flipped_drawingHandler_((POINTER_SIZE, POINTER_SIZE), True, draw)
+
+
+def click_through_panel(frame):
+    # Adapted from macos-harness overlay.py (MIT); see THIRD_PARTY.md.
+    """A window that only shows: no clicks, no keys, no focus, on every Space."""
+    w = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        frame, AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel,
+        AppKit.NSBackingStoreBuffered, False)
+    w.setOpaque_(False)
+    w.setBackgroundColor_(AppKit.NSColor.clearColor())
+    w.setHasShadow_(False)
+    w.setIgnoresMouseEvents_(True)
+    w.setHidesOnDeactivate_(False)
+    w.setReleasedWhenClosed_(False)
+    w.setAnimationBehavior_(AppKit.NSWindowAnimationBehaviorNone)
+    w.setLevel_(Quartz.CGWindowLevelForKey(Quartz.kCGAssistiveTechHighWindowLevelKey))
+    w.setCollectionBehavior_(
+        AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+        | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+        | AppKit.NSWindowCollectionBehaviorStationary
+        | AppKit.NSWindowCollectionBehaviorIgnoresCycle)
+    return w
+
+
+def pointer_panel():
+    # Adapted from macos-harness overlay.py (MIT); see THIRD_PARTY.md.
+    """The pointer's window: frosted glass masked to the arrow, the picture over it."""
+    frame = AppKit.NSMakeRect(0, 0, POINTER_SIZE, POINTER_SIZE)
+    w = click_through_panel(frame)
+    glass = AppKit.NSVisualEffectView.alloc().initWithFrame_(frame)
+    glass.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
+    glass.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+    glass.setState_(AppKit.NSVisualEffectStateActive)
+    glass.setHidden_(AppKit.NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceTransparency())
+    picture = AppKit.NSImageView.alloc().initWithFrame_(frame)
+    picture.setWantsLayer_(True)
+    picture.setLayerUsesCoreImageFilters_(True)  # for the blur of the fade in
+    for v in (glass, picture):
+        w.contentView().addSubview_(v)
+    return w, glass, picture
+
+
+# --- web pages: Chrome through browser-harness (CDP) -------------------------------
+
+# Chromium browsers speak CDP; browser-harness holds the connection (and the
+# person's approval of it). Others fall back to the accessibility tree.
+CHROMIUM = {"Google Chrome", "Google Chrome Canary", "Chromium", "Brave Browser", "Microsoft Edge", "Arc", "Vivaldi", "Dia", "Comet"}
+
+# Runs in the page. Where the page is on screen, so screen points map to CSS pixels.
+GEOMETRY_JS = """JSON.stringify({sx: screenX, sy: screenY, ow: outerWidth, oh: outerHeight, iw: innerWidth,
+ ih: innerHeight, dpr: devicePixelRatio, vis: document.visibilityState, focus: document.hasFocus(),
+ url: location.href, title: document.title})"""
+
+# Runs in the page. Shared by marks and finding: a CSS path, and what an element says.
+DESCRIBE_JS = r"""
+const hoffSel = el => {
+  if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) return '#' + CSS.escape(el.id);
+  const parts = []; let e = el;
+  // Climb until the path names exactly one element (an id or a test id usually ends it).
+  while (e && e.nodeType === 1 && e !== document.documentElement) {
+    let p = e.tagName.toLowerCase(), anchored = false;
+    if (e.id && !/\d{3,}|[0-9a-f]{8,}/i.test(e.id)) { p += '#' + CSS.escape(e.id); anchored = true; }
+    else {
+      for (const a of ['data-testid', 'data-test', 'name', 'aria-label']) {
+        const v = e.getAttribute(a);
+        if (v && v.length < 60) { p += '[' + a + '="' + v.replace(/"/g, '\\"') + '"]'; anchored = a !== 'aria-label'; break; }
+      }
+      const parent = e.parentElement;
+      if (parent && !p.includes('[')) {
+        const same = [...parent.children].filter(c => c.tagName === e.tagName);
+        if (same.length > 1) p += ':nth-of-type(' + (same.indexOf(e) + 1) + ')';
+      }
+    }
+    parts.unshift(p);
+    const path = parts.join(' > ');
+    if ((anchored || parts.length > 2) && document.querySelectorAll(path).length === 1) return path;
+    e = e.parentElement;
+  }
+  return parts.join(' > ');
+};
+const hoffDescribe = el => {
+  const r = el.getBoundingClientRect();
+  const d = {tag: el.tagName.toLowerCase(), selector: hoffSel(el), rect: [r.x, r.y, r.width, r.height]};
+  const role = el.getAttribute('role'); if (role) d.role = role;
+  const label = el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('alt') || el.getAttribute('placeholder');
+  if (label) d.label = label.slice(0, 160);
+  const text = (el.innerText || '').trim().replace(/\s+/g, ' '); if (text) d.text = text.slice(0, 240);
+  if (el.href) d.href = String(el.href);
+  if (el.type === 'password') d.value = '(a password field)';
+  else if (typeof el.value === 'string' && el.value) d.value = el.value.slice(0, 160);
+  d.html = el.outerHTML.slice(0, 300);
+  return d;
+};
+const hoffMeaningful = el => {
+  let e = el;
+  for (let i = 0; i < 4 && e; i++) {
+    if (e.matches('a,button,input,select,textarea,label,summary,[role],[aria-label],h1,h2,h3,h4,h5,img,li,td,th,code,pre')) return e;
+    e = e.parentElement;
+  }
+  return el;
+};
+"""
+
+# Runs in the page: the elements under the mark's points, and the text inside its box.
+MARK_JS = DESCRIBE_JS + r"""
+const pts = %s, box = %s, out = [], seen = new Set();
+for (const [x, y] of pts) {
+  let el = document.elementFromPoint(x, y); if (!el) continue;
+  el = hoffMeaningful(el); if (seen.has(el)) continue; seen.add(el);
+  out.push(hoffDescribe(el)); if (out.length >= 10) break;
+}
+let text = '';
+if (box) {
+  const walk = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT), range = document.createRange();
+  let n, count = 0;
+  while ((n = walk.nextNode()) && text.length < 1500 && count++ < 20000) {
+    if (!n.textContent.trim()) continue;
+    range.selectNodeContents(n);
+    const r = range.getBoundingClientRect();
+    if (!r.width || r.right < box[0] || r.left > box[0] + box[2] || r.bottom < box[1] || r.top > box[1] + box[3]) continue;
+    text += n.textContent.trim().replace(/\s+/g, ' ') + ' ';
+  }
+}
+return JSON.stringify({elements: out, text: text.trim().slice(0, 1500)});
+"""
+
+# Runs in the page: elements by CSS selector or by what they say, visible ones first.
+FIND_JS = DESCRIBE_JS + r"""
+const css = %s, words = %s, out = [];
+let found = css ? [...document.querySelectorAll(css)] : [];
+if (words) {
+  const q = words.toLowerCase();
+  const all = [...document.querySelectorAll('a,button,input,select,textarea,label,summary,[role],[aria-label],h1,h2,h3,h4,h5,li,td,th,span,div,p')];
+  const said = e => [e.getAttribute('aria-label'), e.getAttribute('title'), e.getAttribute('placeholder'),
+                     e.value, (e.innerText || '').trim()].filter(Boolean).map(v => String(v).toLowerCase().replace(/\s+/g, ' '));
+  const score = e => { let s = 0; for (const v of said(e)) { if (v === q) s = Math.max(s, 100); else if (v.startsWith(q)) s = Math.max(s, 70);
+                       else if (v.includes(q) && v.length < q.length * 4) s = Math.max(s, 40); } return s; };
+  found = all.map(e => [score(e), e]).filter(t => t[0] > 0)
+    .map(([s, e]) => [s + (e.matches('a,button,input,select,textarea,summary,[role=button],[role=link],[role=tab],[role=menuitem]') ? 12 : 0), e])
+    .sort((a, b) => b[0] - a[0] || a[1].innerText.length - b[1].innerText.length).map(t => t[1]);
+  found = found.filter((e, i) => !found.slice(0, i).some(o => o.contains(e) && o !== e && o.innerText === e.innerText));
+}
+// Rendered things only: not hidden tooltips, screen-reader text or collapsed menus.
+const shown = e => {
+  const r = e.getBoundingClientRect(), st = getComputedStyle(e);
+  return r.width >= 2 && r.height >= 2 && st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity) > 0.05;
+};
+found = found.filter(shown);
+for (const e of found.slice(0, 15)) {
+  const r = e.getBoundingClientRect(), d = hoffDescribe(e);
+  d.visible = r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+  out.push(d);
+}
+return JSON.stringify(out.sort((a, b) => (b.visible ? 1 : 0) - (a.visible ? 1 : 0)));
+"""
+
+
+def browser_harness_python() -> str | None:
+    """The interpreter browser-harness is installed with, from its launcher."""
+    path = shutil.which("browser-harness")
+    if not path:
+        return None
+    with contextlib.suppress(OSError):
+        with open(path) as f:
+            first = f.readline().strip()
+        if first.startswith("#!") and os.path.exists(first[2:].split()[0]):
+            return first[2:].split()[0]
+    return None
+
+
+# Values go into the Python run by browser-harness with repr(), into page JavaScript
+# with json.dumps(): JSON's null/true/false are not Python.
+def bh(code: str, connect: bool, timeout: float = 12.0):
+    """Run Python with browser-harness's helpers; it ends by printing `HOFF <json>`.
+    connect=False never sets up a connection, so it can never show Chrome's
+    approval: marks use that, and fall back to the accessibility tree."""
+    py = browser_harness_python()
+    if py is None:
+        return None
+    try:
+        if connect:
+            r = subprocess.run(["browser-harness"], input=code, capture_output=True, text=True, timeout=timeout)
+        else:
+            r = subprocess.run([py, "-c", "from browser_harness.helpers import *\n" + code],
+                               capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    for line in reversed(r.stdout.splitlines()):
+        if line.startswith("HOFF "):
+            return json.loads(line[5:])
+    if connect and r.returncode:
+        print(f"browser-harness: {(r.stderr or r.stdout).strip()[-400:]}", file=sys.stderr)
+    return None
+
+
+# Python run by browser-harness: the tab showing at a screen point, or showing a
+# known address. Pages are asked one at a time with a short limit: background and
+# frozen tabs may never answer.
+TAB_PY = r"""
+import json
+want_url, point, GEO = %s, %s, %s
+def geo(t):
+    sid = None
+    try:
+        sid = cdp("Target.attachToTarget", targetId=t["targetId"], flatten=True)["sessionId"]
+        r = cdp("Runtime.evaluate", session_id=sid, _response_timeout=1.5, expression=GEO, returnByValue=True)
+        return json.loads(r["result"]["value"])
+    except Exception:
+        return None
+    finally:
+        if sid:
+            try: cdp("Target.detachFromTarget", sessionId=sid)
+            except Exception: pass
+tabs = list_tabs(include_chrome=False)
+bare = lambda u: (u or "").split("#")[0]
+cands = [t for t in tabs if want_url and t["url"] == want_url] or [t for t in tabs if want_url and bare(t["url"]) == bare(want_url)]
+if not cands and point:
+    for t in tabs:  # tabs of the window under the point: a browser-level call, no page involved
+        try: b = cdp("Browser.getWindowForTarget", targetId=t["targetId"])["bounds"]
+        except Exception: continue
+        if b.get("windowState") != "minimized" and b["left"] <= point[0] < b["left"] + b["width"] and b["top"] <= point[1] < b["top"] + b["height"]:
+            cands.append(t)
+best = None
+for t in cands[:20]:
+    g = geo(t)
+    if not g or g["vis"] != "visible": continue
+    rank = (t["url"] == want_url, g["focus"])
+    if best is None or rank > best[0]: best = (rank, t, g)
+"""
+
+
+def chrome_url(point: tuple[float, float] | None = None) -> str | None:
+    """The address of the page showing in a Chromium window: the one under a screen
+    point, else the front one. From the accessibility tree, so no tab is touched."""
+    if point is not None:
+        pid = app_at(*point)
+    else:
+        apps = [a for a in AppKit.NSWorkspace.sharedWorkspace().runningApplications() if a.localizedName() in CHROMIUM]
+        front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        apps.sort(key=lambda a: front is None or a.processIdentifier() != front.processIdentifier())
+        pid = apps[0].processIdentifier() if apps else None
+    if pid is None:
+        return None
+    app = AX.AXUIElementCreateApplication(pid)
+    AX.AXUIElementSetMessagingTimeout(app, 1.0)
+    AX.AXUIElementSetAttributeValue(app, "AXManualAccessibility", True)  # Chromium builds its tree on request
+    windows = list(_attr(app, "AXWindows") or [])
+    if point is not None:
+        def holds(w):
+            p, z = _attr(w, "AXPosition"), _attr(w, "AXSize")
+            p = _value(p, AX.kAXValueCGPointType) if p is not None else None
+            z = _value(z, AX.kAXValueCGSizeType) if z is not None else None
+            return p is not None and z is not None and p.x <= point[0] < p.x + z.width and p.y <= point[1] < p.y + z.height
+        windows = [w for w in windows if holds(w)][:1]
+    else:
+        main = _attr(app, "AXMainWindow") or _attr(app, "AXFocusedWindow")
+        windows = [main] if main is not None else windows[:1]
+    for attempt in range(2):  # a tree built on request may need a moment the first time
+        for w in windows:
+            queue, seen = [w], 0
+            while queue and seen < 600:
+                el = queue.pop(0)
+                seen += 1
+                if _attr(el, "AXRole") == "AXWebArea":
+                    url = _attr(el, "AXURL")
+                    if url is not None:
+                        return str(url.absoluteString() if hasattr(url, "absoluteString") else url)
+                queue.extend(_attr(el, "AXChildren") or [])
+        time.sleep(0.3)
+    return None
+
+
+def page_origin(g: dict) -> tuple[float, float, float]:
+    """Screen point of the page's top-left corner, and its zoom (CSS px per point)."""
+    scale = 2.0
+    for sc in AppKit.NSScreen.screens():
+        f = sc.frame()
+        main_h = AppKit.NSScreen.screens()[0].frame().size.height
+        top = main_h - (f.origin.y + f.size.height)
+        if f.origin.x <= g["sx"] + 1 < f.origin.x + f.size.width and top <= g["sy"] + 1 < top + f.size.height:
+            scale = sc.backingScaleFactor()
+    zoom = g["dpr"] / scale
+    # Chrome on macOS has no side or bottom frame: what is not page is toolbar, on top.
+    return g["sx"] + (g["ow"] - g["iw"] * zoom) / 2, g["sy"] + (g["oh"] - g["ih"] * zoom), zoom
+
+
+def web_mark(mark: dict, url: str | None) -> dict | None:
+    """What a mark covers on a Chrome page: elements with selectors, and the text inside."""
+    x, y, w, h = mark["bbox"]
+    if mark["kind"] == "point":
+        probes = [tuple(mark["points"][0])]
+    else:
+        probes = [(x + w / 2, y + h / 2)] + [(x + w * i / 4, y + h * j / 4) for i in (1, 2, 3) for j in (1, 2, 3)]
+        pts = mark["points"]
+        probes += [tuple(pts[k]) for k in range(0, len(pts), max(1, len(pts) // 8))]
+    cx, cy = x + w / 2, y + h / 2
+    url = url or chrome_url((cx, cy))
+    code = TAB_PY % (repr(url), repr([cx, cy]), repr(GEOMETRY_JS)) + r"""
+out = None
+if best:
+    _, t, g = best
+    out = {"target": t["targetId"], "geo": g}
+print("HOFF " + json.dumps(out))
+"""
+    found = bh(code, connect=False, timeout=6)
+    if not found:
+        return None
+    ox, oy, zoom = page_origin(found["geo"])
+    css = [[(px - ox) / zoom, (py - oy) / zoom] for px, py in probes]
+    box = None if mark["kind"] == "point" else [(x - ox) / zoom, (y - oy) / zoom, w / zoom, h / zoom]
+    code = "import json\nprint('HOFF ' + js(%s, target_id=%s))" % (
+        repr(MARK_JS % (json.dumps(css), json.dumps(box))), repr(found["target"]))
+    page = bh(code, connect=False, timeout=6)
+    if not page:
+        return None
+    return {"url": found["geo"]["url"], "title": found["geo"]["title"], **page}
+
+
+def web_find(css: str | None, words: str | None, tab: str | None) -> tuple[dict, list[dict]] | None:
+    """Elements on the front Chrome page (or the tab whose address contains `tab`),
+    with their place on screen."""
+    code = TAB_PY % (repr(None if tab else chrome_url()), repr(None), repr(GEOMETRY_JS)) + r"""
+tab = %s
+if tab:
+    best = None
+    for t in list_tabs(include_chrome=False):
+        if tab in t["url"]:
+            g = geo(t)
+            if g: best = ((True, True), t, g); break
+out = None
+if best:
+    _, t, g = best
+    out = {"target": t["targetId"], "geo": g, "found": json.loads(js(%s, target_id=t["targetId"]))}
+print("HOFF " + json.dumps(out))
+""" % (repr(tab), repr(FIND_JS % (json.dumps(css), json.dumps(words))))
+    got = bh(code, connect=True)
+    if not got:
+        return None
+    ox, oy, zoom = page_origin(got["geo"])
+    for e in got["found"]:
+        rx, ry, rw, rh = e["rect"]
+        e["screen"] = [ox + rx * zoom, oy + ry * zoom, rw * zoom, rh * zoom]
+    return got, got["found"]
+
+
+def web_act(target: str, css_point: tuple[float, float], text: str | None, enter: bool) -> str:
+    """Click at a page point, or click then type, through CDP: the real pointer stays put."""
+    code = r"""
+import json
+sid = cdp("Target.attachToTarget", targetId=%s, flatten=True)["sessionId"]
+x, y = %s
+text, enter = %s, %s
+for kind in ("mousePressed", "mouseReleased"):
+    cdp("Input.dispatchMouseEvent", session_id=sid, type=kind, x=x, y=y, button="left", clickCount=1)
+if text is not None:
+    cdp("Input.insertText", session_id=sid, text=text)
+if enter:
+    for kind in ("keyDown", "keyUp"):
+        cdp("Input.dispatchKeyEvent", session_id=sid, type=kind, key="Enter", code="Enter", windowsVirtualKeyCode=13, text="\r" if kind == "keyDown" else "")
+cdp("Target.detachFromTarget", sessionId=sid)
+print("HOFF " + json.dumps(True))
+""" % (repr(target), repr(list(css_point)), repr(text), repr(enter))
+    if not bh(code, connect=True):
+        die("browser-harness could not act on the page. Run `browser-harness --doctor`.", 9)
+    if text is not None:
+        return f"typed {len(text)} characters in the page{' and pressed Return' if enter else ''} (CDP)"
+    return "clicked in the page (CDP)"
+
+
+# --- marks: the person points or circles, the next prompt gets it ---------------
+
+MARKS = os.path.join(STATE, "marks")
+PENDING = os.path.join(MARKS, "pending")  # exists while marks wait for the next prompt
+MARK_TTL = 900.0  # seconds a mark waits for a prompt before it is dropped
+MARK_KEEP = 5  # marks drawn at once; older ones go
+PULSE = 0.55  # seconds a pulse ring takes to grow and fade
+MARK_SHOWN, MARK_FADE = 2.5, 0.8  # seconds a mark stays after the keys are let go, then fades
+SAVING = threading.Lock()  # one save at a time: PyObjC loads functions lazily, not thread-safely
+
+
+def capture_displays() -> list[tuple[str, tuple[float, float, float, float]]]:
+    """Every display as a file, with its bounds in global points. Taken when the
+    marking starts, before anything is drawn, so the crops are clean."""
+    os.makedirs(MARKS, exist_ok=True)
+    err, ids, n = Quartz.CGGetActiveDisplayList(16, None, None)
+    stamp = f"{time.time():.3f}"
+    files = [os.path.join(MARKS, f"screen-{stamp}-{i}.png") for i in range(n)]
+    subprocess.run(["screencapture", "-x", *files], check=False, capture_output=True)
+    out = []
+    for path, d in zip(files, ids[:n]):
+        r = Quartz.CGDisplayBounds(d)
+        if os.path.exists(path):
+            out.append((path, (r.origin.x, r.origin.y, r.size.width, r.size.height)))
+    return out
+
+
+def _png(rep_, path: str) -> None:
+    rep_.representationUsingType_properties_(AppKit.NSBitmapImageFileTypePNG, {}).writeToFile_atomically_(path, True)
+
+
+def save_images(mark: dict, shots, folder: str) -> dict:
+    """crop.png: what was marked, clean. marked.png: its display with the mark
+    drawn on, at one pixel per point."""
+    x, y, w, h = mark["bbox"]
+    cx, cy = x + w / 2, y + h / 2
+    for path, (dx, dy, dw, dh) in shots:
+        if dx <= cx < dx + dw and dy <= cy < dy + dh:
+            break
+    else:
+        return {}
+    src = AppKit.NSBitmapImageRep.imageRepWithData_(AppKit.NSData.dataWithContentsOfFile_(path))
+    scale = src.pixelsWide() / dw
+    crop = Quartz.CGImageCreateWithImageInRect(src.CGImage(), (((x - dx) * scale, (y - dy) * scale), (w * scale, h * scale)))
+    files = {}
+    if crop is not None:
+        files["crop"] = os.path.join(folder, "crop.png")
+        _png(AppKit.NSBitmapImageRep.alloc().initWithCGImage_(crop), files["crop"])
+    # The whole display, the mark drawn where the person drew it.
+    image = AppKit.NSImage.alloc().initWithSize_((dw, dh))
+    image.lockFocusFlipped_(True)
+    src_image = AppKit.NSImage.alloc().initWithSize_((dw, dh))
+    src_image.addRepresentation_(src)
+    src_image.drawInRect_fromRect_operation_fraction_respectFlipped_hints_(
+        ((0, 0), (dw, dh)), ((0, 0), (0, 0)), AppKit.NSCompositingOperationCopy, 1.0, True, None)
+    t = AppKit.NSAffineTransform.transform()
+    t.translateXBy_yBy_(-dx, -dy)
+    t.concat()
+    draw_mark(mark, 1.0, ring=True)
+    image.unlockFocus()
+    files["marked"] = os.path.join(folder, "marked.png")
+    _png(AppKit.NSBitmapImageRep.imageRepWithData_(image.TIFFRepresentation()), files["marked"])
+    # One pixel per point: enough to read, half the size on a Retina screen.
+    subprocess.run(["sips", "--resampleWidth", str(int(dw)), files["marked"]], check=False, capture_output=True)
+    return files
+
+
+def _attr(el, name):
+    err, v = AX.AXUIElementCopyAttributeValue(el, name, None)
+    return None if err else v
+
+
+def _describe(el) -> dict | None:
+    role = _attr(el, "AXRole") or "?"
+    text = {}
+    for k in ("AXTitle", "AXDescription", "AXValue", "AXPlaceholderValue", "AXHelp"):
+        v = _attr(el, k)
+        if isinstance(v, str) and v.strip():
+            text[k[2:].lower()] = " ".join(v.split())[:200]
+    pos, size = _attr(el, "AXPosition"), _attr(el, "AXSize")
+    p = _value(pos, AX.kAXValueCGPointType) if pos is not None else None
+    z = _value(size, AX.kAXValueCGSizeType) if size is not None else None
+    rect = [round(p.x), round(p.y), round(z.width), round(z.height)] if p is not None and z is not None else None
+    if not text and role in ("AXGroup", "AXUnknown", "AXScrollArea", "AXSplitGroup", "AXLayoutArea"):
+        return None  # a box around other things, nothing to say
+    return {"role": role[2:] if role.startswith("AX") else role, **text, "rect": rect}
+
+
+def app_at(x: float, y: float) -> int | None:
+    """The pid of the topmost real window at a point. Our own windows are skipped:
+    while marking they take the mouse, so a system-wide hit test finds us."""
+    me = os.getpid()
+    wins = Quartz.CGWindowListCopyWindowInfo(
+        Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
+    for w in wins or []:  # front to back
+        b = w["kCGWindowBounds"]
+        if not (b["X"] <= x < b["X"] + b["Width"] and b["Y"] <= y < b["Y"] + b["Height"]):
+            continue
+        if w.get("kCGWindowOwnerName") == "Window Server" and w.get("kCGWindowName") == "Menubar":
+            break  # the menu bar belongs to the front app
+        # App windows and their floating panels only: not our overlay, not other
+        # apps' HUDs and invisible full-screen layers (Screenshot, dictation pills).
+        if w["kCGWindowOwnerPID"] == me or not (0 <= w["kCGWindowLayer"] <= 8) or w.get("kCGWindowAlpha", 1) == 0:
+            continue
+        return w["kCGWindowOwnerPID"]
+    front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    return front.processIdentifier() if front else None
+
+
+def element_at(x: float, y: float):
+    pid = app_at(x, y)
+    if pid is None:
+        return None
+    err, el = AX.AXUIElementCopyElementAtPosition(AX.AXUIElementCreateApplication(pid), x, y, None)
+    return None if err else el
+
+
+def what_is_there(mark: dict) -> dict:
+    """The app, window, page and elements under the mark, from the accessibility tree."""
+    x, y, w, h = mark["bbox"]
+    if mark["kind"] == "point":
+        probes = [tuple(mark["points"][0])]
+    else:
+        probes = [(x + w / 2, y + h / 2)]  # the centre first: it names the app and window
+        probes += [(x + w * i / 4, y + h * j / 4) for i in (1, 2, 3) for j in (1, 2, 3) if (i, j) != (2, 2)]
+        pts = mark["points"]
+        probes += [tuple(pts[k]) for k in range(0, len(pts), max(1, len(pts) // 8))]
+    seen, elements, info = [], [], {}
+    for px, py in probes:
+        el = element_at(px, py)
+        if el is None or any(CF.CFEqual(el, o) for o in seen):
+            continue
+        seen.append(el)
+        d = _describe(el)
+        if d:
+            elements.append(d)
+        if not info:
+            err, pid = AX.AXUIElementGetPid(el, None)
+            app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid) if not err else None
+            info["app"] = app.localizedName() if app else None
+            win = _attr(el, "AXWindow")
+            if win is not None and isinstance(_attr(win, "AXTitle"), str):
+                info["window"] = _attr(win, "AXTitle")
+            node = el
+            for _ in range(40):  # up to the web page, for its address
+                if node is None:
+                    break
+                if _attr(node, "AXRole") == "AXWebArea":
+                    url = _attr(node, "AXURL")
+                    if url is not None:
+                        info["url"] = str(url.absoluteString() if hasattr(url, "absoluteString") else url)
+                    break
+                node = _attr(node, "AXParent")
+            if mark["kind"] == "point":  # what it sits in says what it is
+                parent = _attr(el, "AXParent")
+                d2 = _describe(parent) if parent is not None else None
+                if d2:
+                    info["inside"] = d2
+    if info.get("app") in CHROMIUM:
+        web = web_mark(mark, info.get("url"))
+        if web:
+            info["web"] = web
+    return {**info, "elements": elements[:12]}
+
+
+def draw_mark(mark: dict, alpha: float, ring: bool = False) -> None:
+    """A mark into the current flipped context, in global points. On screen a
+    point is a dot (its pulse is drawn by Marking); `ring` circles it for pictures."""
+    color = _rgba(ACCENT, 0.9 * alpha)
+    if mark["kind"] == "point":
+        px, py = mark["points"][0]
+        dot = AppKit.NSBezierPath.bezierPathWithOvalInRect_(((px - 4.5, py - 4.5), (9, 9)))
+        color.setFill()
+        dot.fill()
+        if ring:
+            circle = AppKit.NSBezierPath.bezierPathWithOvalInRect_(((px - 14, py - 14), (28, 28)))
+            circle.setLineWidth_(2.5)
+            color.setStroke()
+            circle.stroke()
+        return
+    path = AppKit.NSBezierPath.bezierPath()
+    pts = mark["points"]
+    path.moveToPoint_(pts[0])
+    for q in pts[1:]:
+        path.lineToPoint_(q)
+    path.setLineWidth_(4.0)
+    path.setLineCapStyle_(AppKit.NSLineCapStyleRound)
+    path.setLineJoinStyle_(AppKit.NSLineJoinStyleRound)
+    AppKit.NSGraphicsContext.saveGraphicsState()
+    _shadow(4, 0.25 * alpha, 1).set()
+    color.setStroke()
+    path.stroke()
+    AppKit.NSGraphicsContext.restoreGraphicsState()
+
+
+class Marking:
+    """Hold the mark keys: the overlay takes the mouse. Click to point, drag to
+    circle or underline. Each mark is saved with what is under it."""
+
+    def __init__(self, overlay) -> None:
+        self.overlay = overlay
+        self.active = False
+        self.stroke: list | None = None  # the points of the mark being drawn
+        self.marks: list[dict] = []  # drawn and waiting: {"kind","points","bbox","until"}
+        self.shots = None  # the displays, captured when the marking started
+        self.shooting: threading.Thread | None = None
+        self.hover: tuple[float, float] | None = None
+        self.saving: list[threading.Thread] = []  # this marking's saves
+        self.pulses: list[tuple[float, float, float]] = []  # (x, y, start): rings that grow and fade
+
+    def forget_screens(self, shooting, saving) -> None:
+        """The full-screen captures only feed the crops: delete them once saved."""
+        for t in saving:
+            t.join(10)
+        if shooting is not None:
+            shooting.join(5)
+            for path, _ in shooting.box.get("s", []):
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+
+    def enter(self) -> None:
+        if self.active:
+            return
+        self.active = True
+        self.hover = mouse()
+        self.pulses.append((*self.hover, time.monotonic()))  # marking is on: one pulse where the pointer is
+        box: dict = {}
+        self.shooting = threading.Thread(target=lambda: box.update(s=capture_displays()), daemon=True)
+        self.shooting.box = box
+        self.shooting.start()
+        for w in self.overlay.windows:
+            w.setIgnoresMouseEvents_(False)
+            w.setAcceptsMouseMovedEvents_(True)
+        self.overlay.repaint(time.monotonic(), everything=True)
+
+    def leave(self) -> None:
+        if not self.active:
+            return
+        if self.stroke:
+            self.up(mouse())
+        self.active, self.hover = False, None
+        now = time.monotonic()
+        for m in self.marks:  # seen long enough: they fade, and still go with the next prompt
+            m["until"] = m["until"] or now + MARK_SHOWN + MARK_FADE
+        for w in self.overlay.windows:
+            w.setIgnoresMouseEvents_(True)
+        threading.Thread(target=self.forget_screens, args=(self.shooting, list(self.saving)), daemon=True).start()
+        self.saving = []
+        self.overlay.repaint(time.monotonic(), everything=True)
+
+    def down(self, at) -> None:
+        self.stroke = [at]
+
+    def drag(self, at) -> None:
+        if self.stroke is not None and math.dist(self.stroke[-1], at) >= 2:
+            self.stroke.append(at)
+        self.hover = at
+
+    def up(self, at) -> None:
+        if self.stroke is None:
+            return
+        pts, self.stroke = self.stroke + [at], None
+        length = sum(math.dist(a, b) for a, b in zip(pts, pts[1:]))
+        if length < 8:  # a click: a point
+            mark = {"kind": "point", "points": [pts[0]]}
+            self.pulses.append((*pts[0], time.monotonic()))
+            px, py = pts[0]
+            mark["bbox"] = [px - 90, py - 60, 180, 120]
+        else:
+            xs, ys = [q[0] for q in pts], [q[1] for q in pts]
+            pad = 16
+            mark = {"kind": "stroke", "points": pts,
+                    "bbox": [min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad]}
+        mark["until"] = None
+        bx, by, bw, bh = mark["bbox"]
+        sx, sy, sw, sh = screen_of(bx + bw / 2, by + bh / 2)
+        x0, y0 = max(bx, sx), max(by, sy)
+        mark["bbox"] = [x0, y0, min(bx + bw, sx + sw) - x0, min(by + bh, sy + sh) - y0]
+        self.marks = (self.marks + [mark])[-MARK_KEEP:]
+        saver = threading.Thread(target=self.save, args=(mark, self.shooting), daemon=True)
+        saver.start()
+        self.saving.append(saver)
+
+    def save(self, mark: dict, shooting) -> None:
+        """Off the main thread: the screenshot, the crop, the accessibility tree."""
+        try:
+            if shooting is not None:
+                shooting.join(3)
+            SAVING.acquire()
+            shots = shooting.box.get("s", []) if shooting is not None else []
+            folder = os.path.join(MARKS, f"{time.time():.3f}")
+            os.makedirs(folder, exist_ok=True)
+            record = {"time": time.time(), "kind": mark["kind"],
+                      "bbox": [round(v) for v in mark["bbox"]],
+                      "points": [[round(a), round(b)] for a, b in mark["points"][:: max(1, len(mark["points"]) // 40)]]}
+            record.update(what_is_there(mark))
+            record["files"] = save_images(mark, shots, folder)
+            with open(os.path.join(folder, "mark.json"), "w") as f:
+                json.dump(record, f, indent=1)
+            open(PENDING, "w").close()
+        except Exception as e:  # a failed save must not take the overlay down
+            print(f"mark not saved: {e!r}", file=sys.stderr, flush=True)
+        finally:
+            if SAVING.locked():
+                SAVING.release()
+
+    def used(self, now: float) -> None:
+        """The marks went with a prompt: they fade now."""
+        for m in self.marks:
+            m["until"] = min(m["until"] or math.inf, now + MARK_FADE)
+
+    def clear(self) -> None:
+        self.marks, self.stroke = [], None
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(PENDING)
+
+    def busy(self, now: float) -> bool:
+        return self.active or bool(self.pulses) or any(m["until"] for m in self.marks)
+
+    def tick(self, now: float) -> None:
+        self.marks = [m for m in self.marks if not m["until"] or now < m["until"]]
+        self.pulses = [p for p in self.pulses if now - p[2] < PULSE]
+
+    def draw(self, now: float) -> None:
+        for m in self.marks:
+            alpha = 1.0 if not m["until"] else max(0.0, min(1.0, (m["until"] - now) / MARK_FADE))
+            draw_mark(m, alpha)
+        if self.stroke and len(self.stroke) > 1:
+            draw_mark({"kind": "stroke", "points": self.stroke}, 1.0)
+        for px, py, start in self.pulses:
+            u = (now - start) / PULSE
+            if 0 <= u < 1:
+                r = 6 + 26 * ease(u)
+                ring = AppKit.NSBezierPath.bezierPathWithOvalInRect_(((px - r, py - r), (2 * r, 2 * r)))
+                ring.setLineWidth_(2.5 * (1 - u) + 0.5)
+                _rgba(ACCENT, 0.9 * (1 - u)).setStroke()
+                ring.stroke()
+        if self.active and self.hover:  # marking is on: a small dot rides with the pointer
+            hx, hy = self.hover
+            dot = AppKit.NSBezierPath.bezierPathWithOvalInRect_(((hx - 3, hy - 3), (6, 6)))
+            _rgba(ACCENT, 0.85).setFill()
+            dot.fill()
+
+
+def rounded_mask(radius: float):
+    """A rounded rectangle that stretches to any size: the shape of the bubble's glass."""
+    side = 2 * radius + 1
+
+    def draw(rect) -> bool:
+        AppKit.NSColor.blackColor().set()
+        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(rect, radius, radius).fill()
+        return True
+
+    image = AppKit.NSImage.imageWithSize_flipped_drawingHandler_((side, side), False, draw)
+    image.setCapInsets_(AppKit.NSEdgeInsets(radius, radius, radius, radius))
+    image.setResizingMode_(AppKit.NSImageResizingModeStretch)
+    return image
+
+
+class BubbleView(AppKit.NSView):
+    def isFlipped(self):
+        return True
+
+    def drawRect_(self, _dirty):
+        OVERLAY.draw_bubble_window(self)
+
+
+def bubble_panel():
+    """The bubble's window: dark frosted glass in a rounded shape, the text view over it."""
+    return glass_panel(BubbleView)
+
+
+def glass_panel(view_class):
+    """A click-through window of dark frosted glass, rounded, with `view_class` drawn over it."""
+    frame = AppKit.NSMakeRect(0, 0, 100, 60)
+    w = click_through_panel(frame)
+    w.setHasShadow_(True)
+    glass = AppKit.NSVisualEffectView.alloc().initWithFrame_(frame)
+    glass.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
+    glass.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
+    glass.setState_(AppKit.NSVisualEffectStateActive)
+    glass.setAppearance_(AppKit.NSAppearance.appearanceNamed_(AppKit.NSAppearanceNameVibrantDark))
+    glass.setMaskImage_(rounded_mask(BUBBLE_RADIUS))
+    glass.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+    view = view_class.alloc().initWithFrame_(frame)
+    view.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+    w.contentView().addSubview_(glass)
+    w.contentView().addSubview_(view)
+    w.setAlphaValue_(0.0)
+    return w, view
+
+
+PREVIEW = os.path.join(STATE, "preview")  # a pretend clip count, for `hoff-harness preview`
+
+
+class GuideView(AppKit.NSView):
+    def isFlipped(self):
+        return True
+
+    def drawRect_(self, _dirty):
+        OVERLAY.draw(self)
+
+    # Only while the mark keys are held: the rest of the time clicks pass through.
+    def acceptsFirstMouse_(self, _event):
+        return True
+
+    def mouseDown_(self, _event):
+        OVERLAY.marking.down(mouse())
+        OVERLAY.repaint(time.monotonic(), everything=True)
+
+    def mouseDragged_(self, _event):
+        OVERLAY.marking.drag(mouse())
+        OVERLAY.repaint(time.monotonic(), everything=True)
+
+    def mouseUp_(self, _event):
+        OVERLAY.marking.up(mouse())
+        OVERLAY.repaint(time.monotonic(), everything=True)
+
+    def mouseMoved_(self, _event):
+        OVERLAY.marking.hover = mouse()
+        OVERLAY.repaint(time.monotonic(), everything=True)
+
+
+class Overlay:
+    def __init__(self) -> None:
+        self.scene = Scene()
+        self.views: list = []
+        self.windows: list = []
+        self.layout: tuple = ()
+        self.timer = None
+        self.last_box = None
+        self.pointer = pointer_panel()
+        self.bubble = bubble_panel()
+        self.look = None  # the (shape, press, blur) the pointer picture shows
+        self.conf, self.conf_stamp = load_config(), None
+        write_keys_hint(self.conf)
+        self.marking = Marking(self)
+        self.build()
+
+    def build(self) -> None:
+        now_layout = tuple(screens())
+        if now_layout == self.layout:
+            return
+        for w in self.windows:
+            w.orderOut_(None)
+        self.windows, self.views, self.layout = [], [], now_layout
+        for s in AppKit.NSScreen.screens():
+            w = click_through_panel(s.frame())
+            v = GuideView.alloc().initWithFrame_(((0, 0), s.frame().size))
+            w.setContentView_(v)
+            w.orderFrontRegardless()
+            self.windows.append(w)
+            self.views.append(v)
+        self.bubble[0].orderFrontRegardless()
+        self.pointer[0].orderFrontRegardless()  # over the ring and the bubble
+
+    # Everything drawn, in global top-left points, as one box: what to repaint.
+    def box(self, now: float):
+        sc = self.scene
+        if sc.alpha(now) <= 0.001:
+            return None
+        x, y = sc.cursor(now)
+        boxes = [(x - 8, y - 8, 16, 16)]
+        if sc.bubble:
+            bx, by, bw, bh = bubble_rect(sc.bubble, x, y)
+            boxes.append((bx - 20, by - 20, bw + 40, bh + 40))
+        if sc.ring:
+            rx, ry, rw, rh = sc.ring["rect"]
+            boxes.append((rx - 24, ry - 24, rw + 48, rh + 48))
+        x0 = min(b[0] for b in boxes)
+        y0 = min(b[1] for b in boxes)
+        return x0, y0, max(b[0] + b[2] for b in boxes) - x0, max(b[1] + b[3] for b in boxes) - y0
+
+    def repaint(self, now: float, everything: bool = False) -> None:
+        box = self.box(now)
+        for v, (sx, sy, _, _) in zip(self.views, self.layout):
+            if everything:
+                v.setNeedsDisplay_(True)
+                continue
+            for b in (self.last_box, box):
+                if b:
+                    v.setNeedsDisplayInRect_(((b[0] - sx, b[1] - sy), (b[2], b[3])))
+        self.last_box = box
+
+    def command(self, c: dict) -> dict:
+        self.build()
+        now = time.monotonic()
+        calm = AppKit.NSWorkspace.sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        conf = self.config()
+        if conf["show_key_hint"] and c.get("text"):
+            c["hint"] = f"{conf['keys']['dismiss'][2]} to dismiss"
+        if c["cmd"] == "marks_used":
+            self.marking.used(now)
+        elif c["cmd"] == "clear_marks":
+            self.marking.clear()
+        reply = self.scene.command(c, now, calm)
+        if conf.get("error"):
+            reply["config_error"] = conf["error"]
+        self.repaint(now, everything=True)
+        self.schedule(0)
+        if c["cmd"] == "quit":
+            AppKit.NSApp.terminate_(None)
+        return reply
+
+    def schedule(self, wait: float) -> None:
+        if self.timer is not None:
+            self.timer.invalidate()
+        self.timer = AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(wait, False, self.tick)
+
+    def tick(self, _t=None) -> None:
+        now = time.monotonic()
+        sc = self.scene
+        sc.tick(now)
+        marking = self.marking
+        marking.tick(now)
+        # With marks on it stays up: the mark keys only work while it runs.
+        if not self.conf["marks"] and not sc.shown and sc.alpha(now) <= 0 and now - sc.touched > IDLE_HIDDEN:
+            AppKit.NSApp.terminate_(None)
+        busy = sc.busy(now) or marking.busy(now)
+        self.place_pointer(now)
+        self.place_bubble(now)
+        self.repaint(now, everything=marking.busy(now))
+        self.schedule(1 / 60 if busy else 0.5)
+
+    def config(self) -> dict:
+        """config.json, read again whenever it changes: no restart needed."""
+        with contextlib.suppress(OSError):
+            stamp = os.stat(CONFIG).st_mtime
+            if stamp != self.conf_stamp:
+                self.conf, self.conf_stamp = load_config(), stamp
+                write_keys_hint(self.conf)
+        return self.conf
+
+    def place_bubble(self, now: float) -> None:
+        sc, (window, view) = self.scene, self.bubble
+        alpha = sc.alpha(now) * (ease((now - sc.bubble["start"]) / 0.18) if sc.bubble else 0)
+        if not sc.bubble or alpha <= 0.001:
+            window.setAlphaValue_(0.0)
+            return
+        x, y = sc.cursor(now)
+        bx, by, bw, bh = bubble_rect(sc.bubble, x, y)
+        main_h = AppKit.NSScreen.screens()[0].frame().size.height
+        window.setFrame_display_(((bx, main_h - by - bh), (bw, bh)), False)
+        window.setAlphaValue_(alpha)
+        view.setNeedsDisplay_(True)
+
+    def draw_bubble_window(self, view) -> None:
+        sc, now = self.scene, time.monotonic()
+        if not sc.bubble:
+            return
+        x, y = sc.cursor(now)
+        bx, by, _, _ = bubble_rect(sc.bubble, x, y)
+        t = AppKit.NSAffineTransform.transform()
+        t.translateXBy_yBy_(-bx, -by)
+        t.concat()
+        self.draw_bubble(sc.bubble, x, y, now, 1.0, glass=True)  # the window fades it
+
+    def place_pointer(self, now: float) -> None:
+        sc = self.scene
+        window, glass, picture = self.pointer
+        x, y, *shape = sc.pose(now)
+        main_h = AppKit.NSScreen.screens()[0].frame().size.height
+        window.setFrameOrigin_((round(x) - POINTER_SIZE / 2, main_h - round(y) - POINTER_SIZE / 2))
+        window.setAlphaValue_(sc.alpha(now))
+        blur = SHOW_BLUR * (1 - ease((now - sc.shown_at) / FADE)) if sc.shown else 0.0
+        look = (tuple(round(v, 3) for v in shape), round(sc.press(now), 3), round(blur, 1))
+        if look != self.look:
+            self.look = look
+            picture.setImage_(pointer_image(tuple(shape), sc.press(now)))
+            glass.setMaskImage_(pointer_image(tuple(shape), sc.press(now), cover_only=True))
+            f = Quartz.CIFilter.filterWithName_withInputParameters_("CIGaussianBlur", {"inputRadius": blur})
+            picture.setContentFilters_([f] if blur else [])
+
+    def draw(self, view) -> None:
+        now = time.monotonic()
+        sc = self.scene
+        alpha = sc.alpha(now)
+        i = self.views.index(view)
+        sx, sy = self.layout[i][0], self.layout[i][1]
+        ctx = AppKit.NSGraphicsContext.currentContext()
+        ctx.saveGraphicsState()
+        t = AppKit.NSAffineTransform.transform()
+        t.translateXBy_yBy_(-sx, -sy)
+        t.concat()
+        self.marking.draw(now)
+        x, y = sc.cursor(now)
+        if alpha > 0.001 and sc.ring:
+            self.draw_ring(sc.ring, now, alpha)
+        ctx.restoreGraphicsState()
+
+    def draw_ring(self, ring: dict, now: float, alpha: float) -> None:
+        rx, ry, rw, rh = ring["rect"]
+        grow = 6 + 10 * (1 - ease((now - ring["start"]) / 0.45))
+        breathe = 0.75 + 0.25 * math.sin((now - ring["start"]) * 3.2)
+        color = OK if ring["ok"] else ACCENT
+        if ring["until"]:
+            alpha *= max(0.0, (ring["until"] - now) / 0.6)
+        path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            ((rx - grow, ry - grow), (rw + 2 * grow, rh + 2 * grow)), 9, 9)
+        _rgba(color, 0.10 * alpha * breathe).setFill()
+        path.fill()
+        path.setLineWidth_(2.5)
+        _rgba(color, 0.95 * alpha * breathe).setStroke()
+        path.stroke()
+
+    def draw_bubble(self, b: dict, cx: float, cy: float, now: float, alpha: float, glass: bool = False) -> None:
+        """The bubble in global points. With `glass` it only tints and outlines:
+        the frosted glass is the window's own (see bubble_panel)."""
+        bx, by, bw, bh = bubble_rect(b, cx, cy)
+        path = AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            ((bx + 0.5, by + 0.5), (bw - 1, bh - 1)), BUBBLE_RADIUS, BUBBLE_RADIUS)
+        _rgba(TINT_BLUE, (0.42 if glass else 0.94) * alpha).setFill()
+        path.fill()
+        path.setLineWidth_(1.0)
+        AppKit.NSColor.colorWithWhite_alpha_(1.0, 0.16 * alpha).setStroke()
+        path.stroke()
+        upto = int((now - b["start"]) * REVEAL_CPS)
+        text = bubble_text(b["title"], b["text"], upto if upto < len(b["text"]) else None)
+        if alpha < 0.999:
+            text.addAttribute_value_range_(AppKit.NSForegroundColorAttributeName,
+                                           AppKit.NSColor.colorWithWhite_alpha_(1.0, 0.94 * alpha),
+                                           (len(b["title"]) + 1 if b["title"] else 0, len(text.string()) - (len(b["title"]) + 1 if b["title"] else 0)))
+        inner = bw - 2 * BUBBLE_PAD[0]
+        text.drawWithRect_options_(((bx + BUBBLE_PAD[0], by + BUBBLE_PAD[1]), (inner, bh - 2 * BUBBLE_PAD[1])),
+                                   AppKit.NSStringDrawingUsesLineFragmentOrigin)
+        if b.get("hint"):
+            hint = hint_text(b["hint"])
+            hh = measure(hint)[1]
+            AppKit.NSGraphicsContext.saveGraphicsState()
+            if alpha < 0.999:  # fade it with the rest of the bubble
+                Quartz.CGContextSetAlpha(AppKit.NSGraphicsContext.currentContext().CGContext(), alpha)
+            hint.drawWithRect_options_(((bx + BUBBLE_PAD[0], by + bh - BUBBLE_PAD[1] - hh), (inner, hh)),
+                                       AppKit.NSStringDrawingUsesLineFragmentOrigin)
+            AppKit.NSGraphicsContext.restoreGraphicsState()
+
+
+OVERLAY: Overlay | None = None
+
+
+def serve() -> None:
+    global OVERLAY
+    os.makedirs(STATE, exist_ok=True)
+    lock = open(LOCK, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return  # another overlay is already up
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(SOCK)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(SOCK)
+    listener.listen(16)
+
+    app = AppKit.NSApplication.sharedApplication()
+    # Accessory, not Prohibited: its windows must take the mouse while marking.
+    # Never in the Dock, and its panels never activate it.
+    app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+    OVERLAY = Overlay()
+    main = AppKit.NSOperationQueue.mainQueue()
+
+    def handle(conn: socket.socket) -> None:
+        with conn:
+            data = b"".join(iter(lambda: conn.recv(65536), b""))
+            done, box = threading.Event(), {}
+
+            def run():
+                try:
+                    box["r"] = OVERLAY.command(json.loads(data))
+                except Exception as e:  # a bad command must not take the overlay down
+                    box["r"] = {"ok": False, "error": repr(e)}
+                done.set()
+
+            main.addOperationWithBlock_(run)
+            done.wait(3)
+            conn.sendall(json.dumps(box.get("r", {"ok": False})).encode())
+
+    def accept() -> None:
+        while True:
+            conn, _ = listener.accept()
+            threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+
+    # The dismiss keys (config.json) put the guide away from any app.
+    def put_away() -> None:  # a block that AppKit calls must return nothing
+        OVERLAY.marking.leave()
+        OVERLAY.command({"cmd": "clear_marks"})
+        OVERLAY.command({"cmd": "hide"})
+
+    def on_key(event) -> None:
+        flags, code, _ = OVERLAY.conf["keys"]["dismiss"]
+        if event.keyCode() == code and event.modifierFlags() & MODIFIER_MASK == flags:
+            main.addOperationWithBlock_(put_away)
+
+    AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(AppKit.NSEventMaskKeyDown, on_key)
+
+    # Holding exactly the mark modifiers turns marking on; letting go turns it off.
+    def on_flags(event) -> None:
+        conf = OVERLAY.config()
+        held = event.modifierFlags() & MODIFIER_MASK
+        if conf["marks"] and held == conf["keys"]["mark"][0]:
+            main.addOperationWithBlock_(OVERLAY.marking.enter)
+        else:
+            main.addOperationWithBlock_(OVERLAY.marking.leave)
+
+    AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(AppKit.NSEventMaskFlagsChanged, on_flags)
+    AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
+        AppKit.NSEventMaskFlagsChanged, lambda e: (on_flags(e), e)[1])
+    OVERLAY.tick()
+    try:
+        app.run()
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(SOCK)
+
+
+# --- CLI ------------------------------------------------------------------------
+
+
+def wait_click(rect, timeout: float) -> bool:
+    """Poll the real pointer until the person clicks inside rect."""
+    x, y, w, h = rect
+    pad = 8
+    was_down = bool(AppKit.NSEvent.pressedMouseButtons() & 1)
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        down = bool(AppKit.NSEvent.pressedMouseButtons() & 1)
+        if down and not was_down:
+            mx, my = mouse()
+            if x - pad <= mx <= x + w + pad and y - pad <= my <= y + h + pad:
+                return True
+            print(f"(clicked elsewhere at {round(mx)},{round(my)}; still waiting)", flush=True)
+        was_down = down
+        time.sleep(0.015)
+    return False
+
+
+BEAT = 0.35  # seconds the cursor rests on a target before acting, so the person sees it
+
+
+def press(e: dict | None, x: float, y: float) -> str:
+    """Press the element the accessibility way; a real click only when that fails."""
+    if e is not None:
+        for action in ("AXPress", "AXPick", "AXConfirm"):
+            if AX.AXUIElementPerformAction(e["el"], action) == 0:
+                return f"pressed ({action})"
+    back = mouse()
+    for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+        ev = Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+        time.sleep(0.03)
+    Quartz.CGWarpMouseCursorPosition(back)  # the person's pointer goes back where it was
+    Quartz.CGAssociateMouseAndMouseCursorPosition(True)
+    return f"clicked at {round(x)},{round(y)} (a real click: this element has no press action)"
+
+
+def type_into(e: dict | None, pid: int | None, text: str, enter: bool, x: float, y: float) -> str:
+    """Focus the field, then send the text as key events to that app only."""
+    how = "focused"
+    if e is None or AX.AXUIElementSetAttributeValue(e["el"], "AXFocused", True) != 0:
+        how = press(e, x, y)
+    time.sleep(0.1)
+    def post(ev):
+        if pid:
+            Quartz.CGEventPostToPid(pid, ev)
+        else:
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, ev)
+    for i in range(0, len(text), 16):  # a key event carries at most ~20 characters
+        chunk = text[i:i + 16]
+        for down in (True, False):
+            ev = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+            Quartz.CGEventKeyboardSetUnicodeString(ev, len(chunk), chunk)
+            post(ev)
+        time.sleep(0.012)
+    if enter:
+        for down in (True, False):
+            post(Quartz.CGEventCreateKeyboardEvent(None, 36, down))
+    return f"typed {len(text)} characters ({how}){' and pressed Return' if enter else ''}"
+
+
+def read_seconds(hold: str | None, text: str | None) -> float:
+    if not hold:
+        return 0.0
+    if hold == "auto":
+        words = len((text or "").split())
+        return min(14.0, 1.2 + words / 3.3)  # about 200 words a minute
+    return float(hold)
+
+
+def show_web(got: dict, found: list[dict], limit: int) -> None:
+    g = got["geo"]
+    print(f"Chrome page {g['title']!r} · {g['url'][:100]}")
+    if not found:
+        print("No matching element on this page.")
+    for i, e in enumerate(found[:limit]):
+        x, y, w, h = (round(v) for v in e["screen"])
+        what = e.get("label") or e.get("text") or e.get("value") or ""
+        print(f"[{i}] {e['tag']:<8} {what[:50]!r:<52} @ {x},{y} {w}x{h}{'' if e['visible'] else '  (scrolled away)'}")
+        print(f"     css: {e['selector']}")
+
+
+def pick_web(a) -> dict:
+    """The page element to point at, by --css or --web words, with its place on screen."""
+    result = web_find(a.css, a.web, a.tab)
+    if result is None:
+        die("No Chrome page to look at: is Chrome open, and connected? Run `hoff-harness browser`.", 9)
+    got, found = result
+    if not found:
+        show_web(got, found, 0)
+        sys.exit(2)
+    if a.pick >= len(found):
+        die(f"Only {len(found)} matches; --pick {a.pick} is out of range.")
+    e = found[a.pick]
+    if not e["visible"]:  # bring it into view, then measure again
+        bh("import json\njs(%s, target_id=%s)\nprint('HOFF true')" % (
+            repr(f"document.querySelector({json.dumps(e['selector'])})?.scrollIntoView({{block: 'center'}})"),
+            repr(got["target"])), connect=True)
+        time.sleep(0.4)
+        result = web_find(e["selector"], None, a.tab)
+        if not result or not result[1]:
+            die("The element went away after scrolling to it.", 2)
+        got, found = result
+        e = found[0]
+    e["target"] = got["target"]
+    x, y, w, h = (round(v) for v in e["screen"])
+    print(f"→ {e['tag']} {(e.get('label') or e.get('text') or '')[:50]!r} @ {x},{y} {w}x{h}  css: {e['selector']}")
+    return e
+
+
+def cmd_point(a) -> None:
+    rect, e, pid, web = None, None, None, None
+    if (a.press or a.type is not None) and a.wait_click:
+        die("--wait-click is for the person doing the step; --press/--type are for doing it for them. Pick one.")
+    if a.css or a.web:
+        web = pick_web(a)
+        rect = list(web["screen"])
+    elif a.app:
+        app, hits = find(a.app, a.find, a.role)
+        if not hits:
+            show_hits(app, hits, 0)
+            sys.exit(2)
+        if a.pick >= len(hits):
+            die(f"Only {len(hits)} matches; --pick {a.pick} is out of range.")
+        e = hits[a.pick]
+        cx, cy = e["rect"][0] + e["rect"][2] / 2, e["rect"][1] + e["rect"][3] / 2
+        on_top = owner_at(cx, cy)
+        if on_top not in (None, app.processIdentifier()):
+            if not a.activate:
+                other = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(on_top)
+                die(f"{label(e)!r} in {app.localizedName()} is covered by "
+                    f"{other.localizedName() if other else 'another window'}. "
+                    "Ask the person to bring it forward, or pass --activate.", 4)
+            app.activateWithOptions_(AppKit.NSApplicationActivateAllWindows)
+            time.sleep(0.35)
+            _, hits = find(a.app, a.find, a.role)  # raising a window can move things
+            e = hits[min(a.pick, len(hits) - 1)]
+        rect, pid = list(e["rect"]), app.processIdentifier()
+        print(f"→ {e['role'][2:]} {label(e)!r} @ {round(rect[0])},{round(rect[1])} {round(rect[2])}x{round(rect[3])}")
+    elif a.rect:
+        rect = [float(v) for v in a.rect.split(",")]
+    if rect:
+        x, y = rect[0] + rect[2] * 0.55, rect[1] + rect[3] * 0.6  # the tip rests on it, a little off its label
+    elif a.at:
+        x, y = (float(v) for v in a.at.split(","))
+    else:
+        die("Say where: --app NAME --find TEXT, --web TEXT, --css SELECTOR, --rect x,y,w,h or --at x,y")
+    msg = {"cmd": "show", "x": x, "y": y, "rect": rect if (rect and not a.no_ring) else None}
+    if a.say is not None:
+        msg.update(text=a.say, title=a.title, **({"for": a.bubble_for} if a.bubble_for else {}))
+    reply = send(msg)
+    if a.press or a.type is not None:
+        time.sleep(reply.get("arrive_in", 0) + BEAT)
+        if not send({"cmd": "status"}).get("shown", True):
+            die("The person put the guide away: they are taking over. Stop and ask before doing more.", 8)
+        send({"cmd": "ok"})  # the press pulse, the ring goes green
+        if web is not None:
+            rx, ry, rw, rh = web["rect"]
+            print(web_act(web["target"], (rx + rw / 2, ry + rh / 2), a.type, a.enter))
+        elif a.type is not None:
+            print(type_into(e, pid, a.type, a.enter, x, y))
+        else:
+            print(press(e, x, y))
+    if a.wait_click:
+        target = rect or [x - 24, y - 24, 48, 48]
+        if wait_click(target, a.timeout):
+            send({"cmd": "ok"})
+            print("clicked")
+        else:
+            print("timeout: no click on the target")
+            sys.exit(3)
+    time.sleep(read_seconds(a.hold, a.say))
+
+
+def cmd_say(a) -> None:
+    msg = {"cmd": "show", "text": a.text, "title": a.title}
+    if a.bubble_for:
+        msg["for"] = a.bubble_for
+    r = send(msg)
+    time.sleep(read_seconds(a.hold, a.text))
+    if not r.get("ok"):
+        die(str(r))
+
+
+def cmd_shot(a) -> None:
+    os.makedirs(STATE, exist_ok=True)
+    path = a.out or os.path.join(STATE, f"shot-{int(time.time())}.png")
+    if a.app:
+        pid = running_app(a.app).processIdentifier()
+        wins = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements, Quartz.kCGNullWindowID)
+        mine = [w for w in wins if w["kCGWindowOwnerPID"] == pid and w["kCGWindowLayer"] == 0]
+        if not mine:
+            die(f"{a.app} has no window on screen.")
+        w = max(mine, key=lambda w: w["kCGWindowBounds"]["Width"] * w["kCGWindowBounds"]["Height"])
+        b = w["kCGWindowBounds"]
+        ox, oy, width = b["X"], b["Y"], b["Width"]
+        subprocess.run(["screencapture", "-x", "-o", "-l", str(w["kCGWindowNumber"]), path], check=True)
+    else:
+        err, ids, n = Quartz.CGGetActiveDisplayList(16, None, None)
+        idx = a.display - 1
+        if idx >= n:
+            die(f"There are {n} displays.")
+        r = Quartz.CGDisplayBounds(ids[idx])
+        ox, oy, width = r.origin.x, r.origin.y, r.size.width
+        subprocess.run(["screencapture", "-x", "-D", str(a.display), path], check=True)
+    # One image pixel per screen point: image (px, py) is screen (ox + px, oy + py).
+    subprocess.run(["sips", "--resampleWidth", str(int(width)), path], check=True, capture_output=True)
+    print(path)
+    print(f"origin {round(ox)},{round(oy)}: image pixel (px,py) is screen point ({round(ox)}+px, {round(oy)}+py)")
+
+
+def cmd_context(a) -> None:
+    """For the UserPromptSubmit hook: what the person marked since the last prompt,
+    as text for the agent. Prints nothing when there is nothing."""
+    # Claude Code also submits its own notices (a background task finished): the
+    # marks wait for a message the person wrote.
+    with contextlib.suppress(Exception):
+        if not sys.stdin.isatty():
+            prompt = str(json.loads(sys.stdin.read() or "{}").get("prompt", ""))
+            if "<task-notification>" in prompt or prompt.lstrip().startswith("<system-reminder>"):
+                return
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(PENDING)
+    now, fresh = time.time(), []
+    for name in sorted(os.listdir(MARKS)) if os.path.isdir(MARKS) else []:
+        folder = os.path.join(MARKS, name)
+        if name.startswith("screen-"):
+            if now - os.path.getmtime(folder) > 60:  # a capture nobody marked on
+                os.unlink(folder)
+            continue
+        meta = os.path.join(folder, "mark.json")
+        if not os.path.isfile(meta):
+            continue
+        if now - os.path.getmtime(meta) > 86400:  # a day old: gone
+            subprocess.run(["rm", "-rf", folder], check=False)
+            continue
+        if os.path.exists(os.path.join(folder, "used")):
+            continue
+        with open(meta) as f:
+            m = json.load(f)
+        open(os.path.join(folder, "used"), "w").close()
+        if now - m["time"] <= MARK_TTL:
+            fresh.append(m)
+    if not fresh:
+        return
+    with contextlib.suppress(Exception):
+        send({"cmd": "marks_used"})
+    def same(a, b) -> bool:  # one thing clicked again: the same first element, close by
+        if a["kind"] != "point" or b["kind"] != "point" or math.dist(a["points"][0], b["points"][0]) > 24:
+            return False
+        first = lambda m: (m.get("elements") or [m.get("inside") or {}])[0]
+        return first(a) == first(b)
+    merged = []
+    for m in fresh:
+        if merged and same(merged[-1], m):
+            merged[-1]["times"] = merged[-1].get("times", 1) + 1
+            continue
+        merged.append(m)
+    fresh = merged
+    lines = [f"hoff: Just before this message the person marked {len(fresh)} thing(s) on their screen "
+             "(\"this\", \"here\", \"that\" likely mean these). Read the images when the text is not enough."]
+    for i, m in enumerate(fresh, 1):
+        x, y, w, h = m["bbox"]
+        where = " · ".join(v for v in (m.get("app"), m.get("window") and f"window {m['window']!r}", m.get("url")) if v)
+        if m["kind"] == "point":
+            px, py = m["points"][0]
+            what = f"Pointed at {px},{py}" + (f" ({m['times']} times)" if m.get("times") else "")
+        else:
+            what = f"Circled or underlined the area {x},{y} {w}x{h}"
+        lines.append(f"{i}. {what} (screen points) in {where or 'an unknown app'}.")
+        for e in m.get("elements", [])[:8]:
+            words = "; ".join(f"{k} {v!r}" for k, v in e.items() if k not in ("role", "rect"))
+            lines.append(f"   - {e['role']}{': ' + words if words else ''}")
+        web = m.get("web")
+        if web:
+            for e in web.get("elements", [])[:8]:
+                words = "; ".join(f"{k} {e[k]!r}" for k in ("label", "text", "value", "href") if e.get(k))
+                lines.append(f"   - page <{e['tag']}>{': ' + words if words else ''}  css: {e['selector']}")
+            if web.get("text"):
+                lines.append(f"   text inside the mark: {web['text'][:600]!r}")
+        if m.get("inside"):
+            e = m["inside"]
+            words = "; ".join(f"{k} {v!r}" for k, v in e.items() if k not in ("role", "rect"))
+            lines.append(f"   - inside {e['role']}{': ' + words if words else ''}")
+        files = m.get("files", {})
+        if files.get("crop"):
+            lines.append(f"   crop: {files['crop']}")
+        if files.get("marked"):
+            lines.append(f"   whole screen with the mark drawn: {files['marked']}")
+    n = len(fresh)
+    print(json.dumps({
+        "systemMessage": f"📎 {n} screen mark{'s' if n != 1 else ''} attached",
+        "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": "\n".join(lines)},
+    }))
+
+
+def cmd_doctor() -> int:
+    """What works, what is missing, and how to fix it. Exit 0 when the core works."""
+    ok = True
+
+    def line(good: bool, what: str, fix: str = "", needed: bool = True) -> None:
+        nonlocal ok
+        print(f"[{'ok ' if good else ('FAIL' if needed else 'warn')}] {what}{'' if good or not fix else '  ->  ' + fix}")
+        ok = ok and (good or not needed)
+
+    host = os.environ.get("TERM_PROGRAM") or "the app running your agent"
+    line(AX.AXIsProcessTrusted(), "Accessibility permission",
+         f"System Settings > Privacy & Security > Accessibility: allow {host}, then restart it")
+    line(bool(Quartz.CGPreflightScreenCaptureAccess()), "Screen Recording permission (marks, screenshots)",
+         f"System Settings > Privacy & Security > Screen Recording: allow {host}, then restart it")
+    line(shutil.which("uv") is not None, "uv", "brew install uv  (or https://docs.astral.sh/uv)")
+    alive = bool(send({"cmd": "status"}))
+    line(alive, "overlay running (needed for the mark keys)", "hoff-harness start", needed=False)
+    conf = load_config()
+    line(not conf.get("error"), f"config.json ({CONFIG})", conf.get("error", ""))
+    if browser_harness_python() is None:
+        line(False, "browser-harness (web pages through Chrome)",
+             "optional: install from https://github.com/browser-use/browser-harness", needed=False)
+    else:
+        tabs = bh("import json\nprint('HOFF ' + json.dumps(len(list_tabs(include_chrome=False))))", connect=False, timeout=5)
+        line(tabs is not None, f"Chrome connected through browser-harness{f' ({tabs} tabs)' if tabs is not None else ''}",
+             "hoff-harness browser", needed=False)
+    return 0 if ok else 1
+
+
+STATUSLINE = os.path.join(os.path.dirname(os.path.realpath(__file__)), "statusline.sh")
+SETTINGS = os.path.expanduser("~/.claude/settings.json")
+
+
+def cmd_statusline(action: str) -> None:
+    """Add or remove the clip counter in Claude Code's status line (~/.claude/settings.json)."""
+    with open(SETTINGS) as f:
+        settings = json.load(f)
+    current = (settings.get("statusLine") or {}).get("command", "")
+    ours = "hoff-harness" in current and "statusline.sh" in current
+    if action == "show":
+        print(f"status line: {'hoff-harness clip counter' if ours else (current or 'none')}")
+        return
+    if action == "install":
+        if current and not ours:
+            die("You already have a status line:\n  " + current + "\nAdd this line's output to it instead:\n  "
+                + f'"{STATUSLINE}"', 10)
+        settings["statusLine"] = {"type": "command", "command": f'"{STATUSLINE}"', "refreshInterval": 1}
+        print("added: the status line shows waiting screen clips (empty when there are none)")
+    elif action == "uninstall":
+        if not ours:
+            print("nothing to remove: the status line is not hoff-harness's")
+            return
+        del settings["statusLine"]
+        print("removed the clip counter from the status line")
+    with open(SETTINGS, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+
+def cmd_preview(count: int, seconds: float) -> None:
+    """Pretend `count` clips wait, for `seconds`: the status line shows it, and
+    nothing is attached to any message."""
+    os.makedirs(STATE, exist_ok=True)
+    with open(PREVIEW, "w") as f:
+        f.write(str(count))
+    print(f"previewing {count} clips for {seconds:g}s: look at Claude Code's status line, under the input box")
+    time.sleep(seconds)
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(PREVIEW)
+
+
+def locked() -> bool:
+    info = Quartz.CGSessionCopyCurrentDictionary() or {}
+    return bool(info.get("CGSSessionScreenIsLocked"))
+
+
+def main() -> None:
+    if sys.argv[1:2] == ["_serve"]:
+        serve()
+        return
+    if sys.argv[1:2] not in (["hide"], ["quit"], ["keys"], ["context"], ["start"], ["doctor"], ["statusline"], ["-h"], ["--help"]) and locked():
+        die("The Mac is locked. Nothing can be shown or read until the person unlocks it.", 5)
+    p = argparse.ArgumentParser(prog="hoff-harness", description="A second cursor with a speech bubble that an agent drives.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    f = sub.add_parser("find", help="list elements of an app (or a Chrome page) on screen, best match first")
+    f.add_argument("--app")
+    f.add_argument("--web", action="store_true", help="look in the front Chrome page instead (by text, or --css)")
+    f.add_argument("--css")
+    f.add_argument("--tab")
+    f.add_argument("query", nargs="?")
+    f.add_argument("--role", help="e.g. Button, MenuItem, TextField")
+    f.add_argument("--limit", type=int, default=15)
+
+    pt = sub.add_parser("point", help="glide the cursor to something, optionally saying something")
+    pt.add_argument("--app")
+    pt.add_argument("--find", help="text of the element (title, label, value, help)")
+    pt.add_argument("--role")
+    pt.add_argument("--pick", type=int, default=0, help="which match of `find` (default 0, the best)")
+    pt.add_argument("--web", help="on the front Chrome page: an element by what it says")
+    pt.add_argument("--css", help="on the front Chrome page: an element by CSS selector")
+    pt.add_argument("--tab", help="with --web/--css: the Chrome tab whose address contains this")
+    pt.add_argument("--rect", help="x,y,w,h in screen points")
+    pt.add_argument("--at", help="x,y in screen points")
+    pt.add_argument("--say")
+    pt.add_argument("--title", default="")
+    pt.add_argument("--for", dest="bubble_for", type=float, help="hide the bubble after this many seconds")
+    pt.add_argument("--hold", help="seconds to wait before returning, or 'auto' for reading time")
+    pt.add_argument("--wait-click", action="store_true", help="return once the person clicks the target")
+    pt.add_argument("--timeout", type=float, default=100.0)
+    pt.add_argument("--press", action="store_true", help="do it for them: press the target once the cursor is on it")
+    pt.add_argument("--type", help="do it for them: focus the target field and type this")
+    pt.add_argument("--enter", action="store_true", help="with --type: press Return after typing")
+    pt.add_argument("--no-ring", action="store_true")
+    pt.add_argument("--activate", action="store_true", help="bring the app to the front first")
+
+    s = sub.add_parser("say", help="change the bubble at the cursor where it is")
+    s.add_argument("text")
+    s.add_argument("--title", default="")
+    s.add_argument("--for", dest="bubble_for", type=float)
+    s.add_argument("--hold")
+
+    sh = sub.add_parser("shot", help="screenshot with one pixel per screen point")
+    sh.add_argument("--app", help="just this app's front window")
+    sh.add_argument("--display", type=int, default=1)
+    sh.add_argument("--out")
+
+    sub.add_parser("keys", help="show the key bindings from config.json and check them")
+    sl = sub.add_parser("statusline", help="add or remove the clip counter in Claude Code's status line")
+    sl.add_argument("action", choices=["install", "uninstall", "show"])
+    pv = sub.add_parser("preview", help="pretend clips are waiting, to see where the count shows")
+    pv.add_argument("--count", type=int, default=2)
+    pv.add_argument("--for", dest="seconds", type=float, default=20.0)
+    sub.add_parser("doctor", help="check permissions, the overlay and the Chrome connection")
+    sub.add_parser("browser", help="connect to Chrome through browser-harness (asks Chrome once) and check it")
+    sub.add_parser("start", help="start the overlay so the mark keys work (for a SessionStart hook)")
+    sub.add_parser("context", help="print what the person marked since the last prompt (for a UserPromptSubmit hook)")
+    sub.add_parser("hide", help="put the cursor and bubble away")
+    sub.add_parser("quit", help="stop the overlay process")
+
+    a = p.parse_args()
+    if a.cmd == "find":
+        if a.web or a.css:
+            result = web_find(a.css, a.query, a.tab)
+            if result is None:
+                die("No Chrome page to look at: is Chrome open, and connected? Run `hoff-harness browser`.", 9)
+            show_web(*result, a.limit)
+        elif a.app:
+            app, hits = find(a.app, a.query, a.role)
+            show_hits(app, hits, a.limit)
+        else:
+            die("find needs --app NAME, or --web for the front Chrome page.")
+    elif a.cmd == "point":
+        cmd_point(a)
+    elif a.cmd == "say":
+        cmd_say(a)
+    elif a.cmd == "shot":
+        cmd_shot(a)
+    elif a.cmd == "statusline":
+        cmd_statusline(a.action)
+    elif a.cmd == "preview":
+        cmd_preview(a.count, a.seconds)
+    elif a.cmd == "doctor":
+        sys.exit(cmd_doctor())
+    elif a.cmd == "browser":
+        if browser_harness_python() is None:
+            die("browser-harness is not installed: https://github.com/browser-use/browser-harness", 9)
+        got = bh("import json\nprint('HOFF ' + json.dumps([t['url'] for t in list_tabs(include_chrome=False)]))", connect=True, timeout=120)
+        if got is None:
+            die("Not connected. Run `browser-harness --doctor`.", 9)
+        print(f"connected: {len(got)} Chrome tabs")
+    elif a.cmd == "start":
+        if not send({"cmd": "status"}):  # nobody answered: start one
+            spawn()
+    elif a.cmd == "context":
+        cmd_context(a)
+    elif a.cmd == "keys":
+        conf = load_config()
+        if conf.get("error"):
+            die(f"config.json is broken, the defaults are in use: {conf['error']}", 6)
+        print(f"config: {CONFIG}")
+        print(f"dismiss  {conf['dismiss']:<20} {conf['keys']['dismiss'][2]}")
+        print(f"mark     {conf['mark']:<20} {conf['keys']['mark'][1]}  (hold, then click or drag){'' if conf['marks'] else '  [marks off]'}")
+        print(f"show_key_hint  {conf['show_key_hint']}")
+    elif a.cmd in ("hide", "quit"):
+        send({"cmd": a.cmd})
+
+
+if __name__ == "__main__":
+    main()

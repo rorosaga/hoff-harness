@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/skills/hoff-harness/scripts/hoff-harness\" start >/dev/null 2>&1 || true",
+            "timeout": 60
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "test -e \"$HOME/Library/Caches/hoff-harness/marks/pending\" && \"${CLAUDE_PLUGIN_ROOT}/skills/hoff-harness/scripts/hoff-harness\" context || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "dismiss": "ctrl+alt+escape",
+  "mark": "ctrl+alt",
+  "marks": true,
+  "show_key_hint": false
+}

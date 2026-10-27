@@ -1,0 +1,10 @@
+name: Idea
+description: Something hoff-harness could do
+labels: [idea]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What would you ask your agent, and what should happen on screen?
+    validations:
+      required: true

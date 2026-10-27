@@ -1,0 +1,24 @@
+name: Bug report
+description: Something did not work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `hoff-harness doctor`
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Last lines of ~/Library/Caches/hoff-harness/overlay.log (if the cursor misbehaved)
+      render: text
+  - type: input
+    id: setup
+    attributes:
+      label: macOS version, agent (Claude Code, Codex, ...) and the app it runs in

@@ -1,0 +1,11 @@
+{
+  "name": "hoff-harness",
+  "owner": { "name": "rorosaga", "url": "https://github.com/rorosaga" },
+  "plugins": [
+    {
+      "name": "hoff-harness",
+      "source": "./",
+      "description": "A second cursor with a speech bubble that your agent drives on your Mac, and screen marks as context."
+    }
+  ]
+}
