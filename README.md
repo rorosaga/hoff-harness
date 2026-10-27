@@ -85,11 +85,9 @@ Other agents and manual setup: [install.md](install.md).
 
 ## Why "hoff"
 
-**hoff** is short for **hands-off**. The idea started at a hackathon at the
-beginning of 2026, where [Ricky](https://github.com/ramcav) and
-[I](https://github.com/rorosaga) built Hoff: an onboarding guide that learned a
-website and walked people through it with on-page tours. hoff-harness takes the
-same idea to the whole Mac, and gives it to your coding agent.
+**hoff** is short for **hands-off**. The idea mainly came from Hoff, a hackathon
+project [Ricky](https://github.com/ramcav) and [I](https://github.com/rorosaga)
+built together and demoed at YC at the Browser Use hackathon.
 
 ## Credits
 
@@ -97,7 +95,6 @@ same idea to the whole Mac, and gives it to your coding agent.
   [macos-harness](https://github.com/browser-use/macos-harness) (MIT).
 - Web pages go through
   [browser-harness](https://github.com/browser-use/browser-harness) (MIT).
-- Built with [Ricky](https://github.com/ramcav)'s ideas from the original Hoff.
 - Inspired by [Clicky](https://github.com/farzaa/clicky) and HeyClicky.
 
 Details and licences: [THIRD_PARTY.md](THIRD_PARTY.md). Contributing:
