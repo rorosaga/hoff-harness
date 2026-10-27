@@ -7,6 +7,8 @@ them in a speech bubble, walks you through tasks step by step, or does them whil
 you watch. And you can point back: hold **⌃⌥**, circle something, and ask
 *"what is this?"*. Your agent gets exactly what you marked.
 
+**[hoff.rorosaga.com](https://hoff.rorosaga.com)**: see it in action.
+
 **macOS only.** Works with Claude Code, Codex, Cursor, OpenCode, Pi, Hermes and
 other agents that can run shell commands.
 
