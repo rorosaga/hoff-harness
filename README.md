@@ -10,14 +10,14 @@ you watch. And you can point back: hold **⌃⌥**, circle something, and ask
 **[hoff.rorosaga.com](https://hoff.rorosaga.com)**: see it in action.
 
 **macOS only.** Works with Claude Code, Cursor, the Claude desktop app (MCP), Codex,
-OpenCode, Pi, Hermes and other agents that can run shell commands.
+Antigravity, OpenCode, Pi, Hermes and other agents that can run shell commands.
 
 ## Install
 
-Paste this into Claude Code:
+Paste this into Claude Code, Cursor, Codex or any agent that runs commands:
 
 ```text
-Install hoff-harness from https://github.com/rorosaga/hoff-harness: run `claude plugin marketplace add rorosaga/hoff-harness` and `claude plugin install hoff-harness@hoff-harness`. Make sure `uv` is installed. Then run `doctor` with the plugin's script (`~/.claude/plugins/cache/hoff-harness/hoff-harness/*/skills/hoff-harness/scripts/hoff-harness doctor`), explain any missing macOS permission and ask before requesting it. Offer to add the clip counter to my status line with `hoff-harness statusline install`. If browser-harness is installed, run `hoff-harness browser` to connect Chrome. Finally point at something in Finder: `hoff-harness point --app Finder --find "Go" --say "Hi, I'm your guide cursor."`
+Install hoff-harness (https://github.com/rorosaga/hoff-harness), a second cursor for coding agents on macOS. If you are Claude Code: run `claude plugin marketplace add rorosaga/hoff-harness` and `claude plugin install hoff-harness@hoff-harness`; the script is then `~/.claude/plugins/cache/hoff-harness/hoff-harness/*/skills/hoff-harness/scripts/hoff-harness`. If you are another agent (Cursor, Codex, Antigravity...): run `git clone https://github.com/rorosaga/hoff-harness ~/code/hoff-harness`, `mkdir -p ~/.agents/skills` and `ln -sfn ~/code/hoff-harness/skills/hoff-harness ~/.agents/skills/hoff-harness` (if you load skills from another folder, link it there too), then read its SKILL.md; the script is `~/code/hoff-harness/skills/hoff-harness/scripts/hoff-harness`. Make sure `uv` is installed. Run the script with `doctor`, explain any missing macOS permission and ask before requesting it. In Claude Code, offer the clip counter for my status line with `statusline install`. If browser-harness is installed, run it with `browser` to connect Chrome. Finally point at something in Finder: run it with `point --app Finder --find "Go" --say "Hi, I'm your guide cursor."`. If you can't run commands (the Claude app's chat, for example), tell me to paste this into Claude Code or the Claude app's Code tab instead.
 ```
 
 Other agents and manual setup: [install.md](install.md).
@@ -52,7 +52,7 @@ agent (*"use cmd+shift for marking"*); they live in
 | Agent | Point, guide, do | Marks attach to your message | Tested |
 |---|---|---|---|
 | **Claude Code** (terminal, desktop app, IDEs) | ✓ | ✓ automatically (plugin hooks) | ✓ |
-| **Codex**, **OpenCode**, **Pi**, **Hermes**, **Gemini CLI** | ✓ through [SKILL.md](skills/hoff-harness/SKILL.md) | the agent runs `hoff-harness context` | not yet |
+| **Codex**, **Antigravity**, **OpenCode**, **Pi**, **Hermes** | ✓ through [SKILL.md](skills/hoff-harness/SKILL.md) | the agent runs `hoff-harness context` | not yet |
 | **Cursor** | ✓ finds the skill in `~/.claude/skills` | the agent runs `hoff-harness context` | ✓ |
 | **Claude desktop app** | ✓ through `hoff-harness mcp` ([install.md](install.md)) | the `marks` tool | connects ✓; pointing once uv has Accessibility |
 | ChatGPT | only remote MCP servers | | not possible yet |

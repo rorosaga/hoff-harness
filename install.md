@@ -33,7 +33,10 @@ The tool is a command any agent with a shell can run:
 ```bash
 git clone https://github.com/rorosaga/hoff-harness ~/code/hoff-harness
 ln -sf ~/code/hoff-harness/skills/hoff-harness/scripts/hoff-harness ~/.local/bin/hoff-harness
+mkdir -p ~/.agents/skills && ln -sfn ~/code/hoff-harness/skills/hoff-harness ~/.agents/skills/hoff-harness
 ```
+
+Codex and Cursor load skills from `~/.agents/skills` by themselves.
 
 Give the agent [SKILL.md](skills/hoff-harness/SKILL.md) as instructions, the way
 it takes skills or rules. Marks are not attached for it automatically: it runs
