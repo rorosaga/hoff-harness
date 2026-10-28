@@ -443,6 +443,7 @@ class Scene:
         self.pulses: list[float] = []  # when each press pulse starts
         self.bubble = None  # {"title", "text", "start", "until"}
         self.ring = None  # {"rect", "start", "ok", "until"}
+        self.hide_at = None  # put itself away then (after a step is done), unless told more
         self.touched = time.monotonic()
 
     def alpha(self, now: float) -> float:
@@ -459,6 +460,8 @@ class Scene:
         return min((P.press_scale(now - at) for at in self.pulses), default=1.0)
 
     def busy(self, now: float) -> bool:
+        if self.hide_at:
+            return True
         if now - self.fade[2] < FADE:
             return True
         if now - self.began < self.move["duration"]:
@@ -495,8 +498,20 @@ class Scene:
     def command(self, c: dict, now: float, calm: bool = False) -> dict:
         self.touched = now
         cmd = c["cmd"]
+        if cmd != "status":
+            self.hide_at = None
         if cmd == "hide":
             self.hide(now)
+        elif cmd == "follow":  # its target moved (a scroll, a window dragged): stay on it, nothing restarts
+            if self.shown:
+                self.go((float(c["x"]), float(c["y"])), now, calm)
+                if "rect" in c:
+                    if not c["rect"]:
+                        self.ring = None
+                    elif self.ring:
+                        self.ring["rect"] = c["rect"]
+                    else:
+                        self.ring = {"rect": c["rect"], "start": now, "ok": None, "until": None}
         elif cmd == "ok":
             self.pulses = [max(now, self.began + self.move["arrive"])]
             if self.ring:
@@ -514,13 +529,19 @@ class Scene:
                                    "until": now + hold if hold else None, "hint": c.get("hint", "")}
                 else:
                     self.bubble = None
+            if c.get("then_hide"):
+                self.hide_at = now + float(c["then_hide"])
         x, y = self.move["end"]
         arrive = max(0.0, self.began + self.move["arrive"] - now)
         ax, ay = self.cursor(now)  # where it is this instant, mid-glide included
         return {"ok": True, "cursor": [round(x), round(y)], "at": [round(ax, 1), round(ay, 1)],
-                "arrive_in": round(arrive, 3), "shown": self.shown, "talking": bool(self.bubble)}
+                "arrive_in": round(arrive, 3), "shown": self.shown, "talking": bool(self.bubble),
+                "ring": [round(v, 1) for v in self.ring["rect"]] if self.ring else None}
 
     def tick(self, now: float) -> None:
+        if self.hide_at and now > self.hide_at:
+            self.hide_at = None
+            self.hide(now)
         if self.bubble and self.bubble["until"] and now > self.bubble["until"]:
             self.bubble = None
         if self.ring and self.ring["until"] and now > self.ring["until"]:
@@ -712,6 +733,18 @@ GEOMETRY_JS = """JSON.stringify({sx: screenX, sy: screenY, ow: outerWidth, oh: o
 
 # Runs in the page. Shared by marks and finding: a CSS path, and what an element says.
 DESCRIBE_JS = r"""
+// What can show of an element: the window, cut by every box that scrolls or clips (a dialog, a list).
+const hoffClip = el => {
+  let c = [0, 0, innerWidth, innerHeight];
+  for (let a = el.parentElement; a && a !== document.documentElement; a = a.parentElement) {
+    const s = getComputedStyle(a);
+    if (/auto|scroll|hidden|clip/.test(s.overflowX + ' ' + s.overflowY)) {
+      const b = a.getBoundingClientRect();
+      c = [Math.max(c[0], b.left), Math.max(c[1], b.top), Math.min(c[2], b.right), Math.min(c[3], b.bottom)];
+    }
+  }
+  return c;
+};
 const hoffSel = el => {
   if (el.id && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) return '#' + CSS.escape(el.id);
   const parts = []; let e = el;
@@ -806,8 +839,8 @@ const shown = e => {
 };
 found = found.filter(shown);
 for (const e of found.slice(0, 15)) {
-  const r = e.getBoundingClientRect(), d = hoffDescribe(e);
-  d.visible = r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+  const r = e.getBoundingClientRect(), d = hoffDescribe(e), c = hoffClip(e);
+  d.visible = Math.min(c[2], r.right) - Math.max(c[0], r.left) >= 2 && Math.min(c[3], r.bottom) - Math.max(c[1], r.top) >= 2;
   out.push(d);
 }
 return JSON.stringify(out.sort((a, b) => (b.visible ? 1 : 0) - (a.visible ? 1 : 0)));
@@ -1751,22 +1784,164 @@ def serve() -> None:
 # --- CLI ------------------------------------------------------------------------
 
 
-def wait_click(rect, timeout: float) -> bool:
-    """Poll the real pointer until the person clicks inside rect."""
-    x, y, w, h = rect
-    pad = 8
+# Where a target is now, while its bubble is up: "here" (with the part that shows),
+# "away" (scrolled out of its window or dialog, with the box it shows in), "gone"
+# (closed, removed, navigated away) or "unknown" (no answer yet).
+TRACK_JS = DESCRIBE_JS + r"""
+const e = document.querySelector(%s);
+const g = {sx: screenX, sy: screenY, ow: outerWidth, oh: outerHeight, iw: innerWidth, ih: innerHeight, dpr: devicePixelRatio};
+const r = e && e.getBoundingClientRect();
+if (!r || r.width < 1 || r.height < 1 || getComputedStyle(e).visibility === 'hidden') return JSON.stringify({gone: true, g});
+const c = hoffClip(e), v = [Math.max(c[0], r.left), Math.max(c[1], r.top), Math.min(c[2], r.right), Math.min(c[3], r.bottom)];
+return JSON.stringify({g, clip: [c[0], c[1], c[2] - c[0], c[3] - c[1]],
+  seen: v[2] - v[0] >= 2 && v[3] - v[1] >= 2 ? [v[0], v[1], v[2] - v[0], v[3] - v[1]] : null});
+"""
+
+TRACK_PY = r"""
+import json, time
+tid, code = %s, %s
+while True:
+    try:
+        out = js("(() => {" + code + "})()", target_id=tid)
+    except Exception as e:  # the tab closed or went to another page
+        out = json.dumps({"gone": True, "error": str(e)[:200]})
+    print("HOFF " + out, flush=True)
+    time.sleep(0.08)
+"""
+
+
+class WebTarget:
+    """A page element, asked where it is a dozen times a second by one browser-harness process."""
+
+    def __init__(self, target: str, selector: str) -> None:
+        self.state = None
+        py = browser_harness_python()
+        code = TRACK_PY % (repr(target), repr(TRACK_JS % json.dumps(selector)))
+        self.proc = subprocess.Popen([py, "-c", "from browser_harness.helpers import *\n" + code],
+                                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
+        threading.Thread(target=self.read, daemon=True).start()
+
+    def read(self) -> None:
+        for line in self.proc.stdout:
+            if line.startswith("HOFF "):
+                with contextlib.suppress(ValueError):
+                    self.state = json.loads(line[5:])
+
+    def where(self):
+        st = self.state
+        if st is None or self.proc.poll() is not None:
+            return "unknown", None, None
+        if st.get("gone"):
+            return "gone", None, None
+        ox, oy, zoom = page_origin(st["g"])
+        screen = lambda r: [ox + r[0] * zoom, oy + r[1] * zoom, r[2] * zoom, r[3] * zoom]
+        if st["seen"] is None:
+            return "away", None, screen(st["clip"])
+        return "here", screen(st["seen"]), screen(st["clip"])
+
+    def close(self) -> None:
+        self.proc.terminate()
+
+
+def _frame(el):
+    p, z = _attr(el, "AXPosition"), _attr(el, "AXSize")
+    p = _value(p, AX.kAXValueCGPointType) if p is not None else None
+    z = _value(z, AX.kAXValueCGSizeType) if z is not None else None
+    return [p.x, p.y, z.width, z.height] if p is not None and z is not None else None
+
+
+def _cut(r, c):
+    x0, y0, x1, y1 = max(r[0], c[0]), max(r[1], c[1]), min(r[0] + r[2], c[0] + c[2]), min(r[1] + r[3], c[1] + c[3])
+    return [x0, y0, x1 - x0, y1 - y0] if x1 - x0 >= 2 and y1 - y0 >= 2 else None
+
+
+class AXTarget:
+    """An app's element, asked through the accessibility API; its window and the scroll
+    areas it sits in are what can show of it."""
+
+    def __init__(self, el) -> None:
+        self.el, self.boxes, a = el, [], el
+        for _ in range(20):
+            a = _attr(a, "AXParent")
+            if a is None:
+                break
+            if _attr(a, "AXRole") in ("AXScrollArea", "AXWindow"):
+                self.boxes.append(a)
+
+    def where(self):
+        r = _frame(self.el)
+        if r is None or r[2] < 1 or r[3] < 1:
+            return "gone", None, None
+        clip = None
+        for b in self.boxes:
+            f = _frame(b)
+            if f is not None:
+                clip = f if clip is None else (_cut(clip, f) or [clip[0], clip[1], 0, 0])
+        if clip is None:
+            return "here", r, None
+        seen = _cut(r, clip)
+        return ("here", seen, clip) if seen else ("away", None, clip)
+
+    def close(self) -> None:
+        pass
+
+
+FOLLOW_EVERY = 0.1  # seconds between asking where the target is
+GONE_AFTER = 0.5  # missing this long is gone, not a page redrawing it
+AWAY_SAY = "It scrolled out of view. Scroll back to it."
+
+
+def aim(rect) -> tuple[float, float]:
+    return rect[0] + rect[2] * 0.55, rect[1] + rect[3] * 0.6  # the tip rests on it, a little off its label
+
+
+def stay_on(target, rect, a, wait: bool, seconds: float) -> str:
+    """While the bubble is up: keep the cursor and ring on the target as it scrolls or its
+    window moves, and with `wait`, notice the person's click on it. Returns "clicked",
+    "timeout", "gone" or "held"."""
+    ring, pad, state = not a.no_ring, 8, "here"
     was_down = bool(AppKit.NSEvent.pressedMouseButtons() & 1)
-    end = time.monotonic() + timeout
-    while time.monotonic() < end:
-        down = bool(AppKit.NSEvent.pressedMouseButtons() & 1)
-        if down and not was_down:
-            mx, my = mouse()
-            if x - pad <= mx <= x + w + pad and y - pad <= my <= y + h + pad:
-                return True
-            print(f"(clicked elsewhere at {round(mx)},{round(my)}; still waiting)", flush=True)
-        was_down = down
-        time.sleep(0.015)
-    return False
+    end = time.monotonic() + seconds
+    next_ask, gone_since = 0.0, None
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= end:
+                return "timeout" if wait else "held"
+            if wait:
+                down = bool(AppKit.NSEvent.pressedMouseButtons() & 1)
+                if down and not was_down:
+                    mx, my = mouse()
+                    x, y, w, h = rect
+                    if state == "here" and x - pad <= mx <= x + w + pad and y - pad <= my <= y + h + pad:
+                        return "clicked"
+                    print(f"(clicked elsewhere at {round(mx)},{round(my)}; still waiting)", flush=True)
+                was_down = down
+            if target is not None and now >= next_ask:
+                next_ask = now + FOLLOW_EVERY
+                where, seen, clip = target.where()
+                gone_since = (gone_since or now) if where == "gone" else None
+                if gone_since and now - gone_since >= GONE_AFTER:
+                    return "gone"
+                if where == "here":
+                    if state == "away" and a.say:
+                        send({"cmd": "show", "text": a.say, "title": a.title})
+                    if state == "away" or max(abs(p - q) for p, q in zip(seen, rect)) >= 1:
+                        x, y = aim(seen)
+                        send({"cmd": "follow", "x": x, "y": y, **({"rect": seen} if ring else {})})
+                    rect, state = seen, "here"
+                elif where == "away" and state != "away":
+                    state = "away"
+                    x, y = aim(rect)  # waits at the edge it went past
+                    x = min(max(x, clip[0] + 14), clip[0] + clip[2] - 14)
+                    y = min(max(y, clip[1] + 14), clip[1] + clip[3] - 14)
+                    send({"cmd": "follow", "x": x, "y": y, "rect": None})
+                    if a.say:
+                        send({"cmd": "show", "text": AWAY_SAY, "title": a.title})
+            time.sleep(0.015)
+    finally:
+        if target is not None:
+            target.close()
 
 
 BEAT = 0.35  # seconds the cursor rests on a target before acting, so the person sees it
@@ -1845,15 +2020,22 @@ def pick_web(a) -> dict:
     if a.pick >= len(found):
         die(f"Only {len(found)} matches; --pick {a.pick} is out of range.")
     e = found[a.pick]
-    if not e["visible"]:  # bring it into view, then measure again
+    if not e["visible"]:  # bring it into view, then measure again until it rests
         bh("import json\njs(%s, target_id=%s)\nprint('HOFF true')" % (
-            repr(f"document.querySelector({json.dumps(e['selector'])})?.scrollIntoView({{block: 'center'}})"),
+            repr(f"document.querySelector({json.dumps(e['selector'])})?.scrollIntoView("
+                 "{block: 'center', inline: 'nearest', behavior: 'instant'})"),
             repr(got["target"])), connect=True)
-        time.sleep(0.4)
-        result = web_find(e["selector"], None, a.tab)
-        if not result or not result[1]:
-            die("The element went away after scrolling to it.", 2)
-        got, found = result
+        before = None
+        for _ in range(6):
+            time.sleep(0.15)
+            result = web_find(e["selector"], None, a.tab)
+            if not result or not result[1]:
+                die("The element went away after scrolling to it.", 2)
+            got, found = result
+            here = found[0]["screen"]
+            if before and max(abs(p - q) for p, q in zip(here, before)) < 1:
+                break
+            before = here
         e = found[0]
     e["target"] = got["target"]
     x, y, w, h = (round(v) for v in e["screen"])
@@ -1917,15 +2099,35 @@ def cmd_point(a) -> None:
             print(type_into(e, pid, a.type, a.enter, x, y))
         else:
             print(press(e, x, y))
+    seconds = read_seconds(a.hold, a.say)
+    if not a.wait_click and not seconds:
+        return
+    # It stays on its target while it waits: a scroll, a moved window, a dialog closing.
+    target = None
+    if web is not None and web.get("selector") and browser_harness_python():
+        target = WebTarget(web["target"], web["selector"])
+    elif e is not None and not (a.press or a.type is not None):
+        target = AXTarget(e["el"])
     if a.wait_click:
-        target = rect or [x - 24, y - 24, 48, 48]
-        if wait_click(target, a.timeout):
+        got = stay_on(target, rect or [x - 24, y - 24, 48, 48], a, True, a.timeout)
+        if got == "clicked":
+            # done: the bubble says so, then it all puts itself away (unless the next step comes first)
             send({"cmd": "ok"})
+            send({"cmd": "show", "then_hide": 1.4, **({"text": "Done.", "title": a.title} if a.say else {})})
             print("clicked")
+            time.sleep(seconds)
+        elif got == "gone":
+            send({"cmd": "hide"})
+            print("gone: the target left the screen before a click on it (a dialog closed, the page changed, "
+                  "or they did it another way). Look at the screen before the next step.")
+            sys.exit(10)
         else:
             print("timeout: no click on the target")
             sys.exit(3)
-    time.sleep(read_seconds(a.hold, a.say))
+    elif stay_on(target if not (a.press or a.type is not None) else None, rect or [x - 24, y - 24, 48, 48],
+                 a, False, seconds) == "gone":
+        send({"cmd": "hide"})
+        print("(the target left the screen, so the guide put itself away)")
 
 
 def cmd_say(a) -> None:

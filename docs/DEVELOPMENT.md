@@ -127,6 +127,12 @@ points Claude Code at a copy in `~/.config/hoff-harness/`, refreshed on every `s
 
 - **Live:** `hoff-harness point --app Finder --find "Share" --say "hi" --hold 2`,
   then `hoff-harness shot` and look at the image.
+- **Following a target:** `tests/follow_test.py` opens `tests/scroll-dialog.html`
+  in a Chrome guest window, scrolls the dialog, moves the window, scrolls the
+  target away and back, clicks it, and closes the dialog without a click,
+  checking the overlay's `status` (`ring`, `shown`) at each step. It needs Chrome
+  connected through browser-harness, and the demo recorder's helpers from the
+  website repo (the guest window and the hand); the command is at its top.
 - **Off-screen:** load the script with `SourceFileLoader` and call
   `draw_pointer` / `Overlay.draw_bubble` inside `NSImage.lockFocusFlipped_`.
   Useful when the Mac is locked.

@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- A long page with a scrolling dialog: the case of a point that must follow its target. -->
+<html><head><meta charset="utf-8"><title>hoff scroll test</title>
+<style>
+  body { margin: 0; font: 15px system-ui; background: #f4f1ea; height: 3000px; }
+  #dialog { position: fixed; left: 120px; top: 120px; width: 420px; height: 320px; overflow: auto;
+    background: white; border: 1px solid #999; border-radius: 10px; box-shadow: 0 10px 40px #0003; }
+  .row { padding: 10px 16px; border-bottom: 1px solid #eee; }
+  button { font: inherit; padding: 6px 12px; }
+</style></head>
+<body>
+<div id="dialog">
+  <div class="row"><b>Edit access</b></div>
+</div>
+<script>
+  const d = document.getElementById('dialog');
+  for (let i = 1; i <= 40; i++) {
+    const r = document.createElement('div'); r.className = 'row';
+    r.innerHTML = i === 30 ? 'Row 30 <button id="target">Save changes</button>' : 'Row ' + i;
+    d.appendChild(r);
+  }
+  document.getElementById('target').onclick = () => d.remove();  // saving closes the dialog
+</script>
+</body></html>

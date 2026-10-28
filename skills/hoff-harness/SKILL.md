@@ -79,8 +79,14 @@ so they see it, then presses it. `--type "text"` focuses a field and types,
    match when the best one is wrong.
 3. **Pace it.**
    - The person's step: `--wait-click`. It returns `clicked` when they click the
-     target (the ring turns green), or exits 3 after `--timeout` seconds
-     (default 100). Set the Bash tool timeout above it.
+     target: the ring turns green, the bubble says "Done." and the guide puts
+     itself away after a moment, unless your next command comes first. It exits
+     3 after `--timeout` seconds (default 100); set the Bash tool timeout above
+     it. It exits 10 if the target leaves the screen first (a dialog closed,
+     the page changed, or they did it another way), and puts the guide away.
+   - While it waits (`--wait-click`, `--hold`), the cursor and ring stay on the
+     target as the page or a dialog scrolls and as windows move. Scrolled out of
+     view, the bubble asks the person to scroll back to it.
    - Your step: `--press` or `--type`, as above.
    - Something to read: `--hold auto` waits about as long as reading the bubble
      takes, so several points can be chained with `&&` in one call.
@@ -152,6 +158,8 @@ click there and puts the person's pointer back where it was.
 - `6` (`keys`) config.json is broken: fix it, the defaults are in use meanwhile.
 - `8` the person dismissed the guide during "do it for them": stop and ask.
 - `9` no Chrome page to work with: run `"$G" browser`, or `browser-harness --doctor`.
+- `10` (`--wait-click`) the target left the screen before a click on it: look
+  at the screen (`shot` or `find`) and go on from what is there now.
 
 ## The clip counter
 
