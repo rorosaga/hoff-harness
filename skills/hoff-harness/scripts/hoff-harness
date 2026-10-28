@@ -1869,6 +1869,9 @@ def cmd_point(a) -> None:
         web = pick_web(a)
         rect = list(web["screen"])
     elif a.app:
+        if a.activate:  # first, as it says: an app in the back has no menu bar on screen to find
+            running_app(a.app).activateWithOptions_(AppKit.NSApplicationActivateAllWindows)
+            time.sleep(0.35)
         app, hits = find(a.app, a.find, a.role)
         if not hits:
             show_hits(app, hits, 0)

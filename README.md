@@ -17,7 +17,7 @@ Antigravity, OpenCode, Pi, Hermes and other agents that can run shell commands.
 Paste this into Claude Code, Cursor, Codex or any agent that runs commands:
 
 ```text
-Install hoff-harness (https://github.com/rorosaga/hoff-harness), a second cursor for coding agents on macOS. If you are Claude Code: run `claude plugin marketplace add rorosaga/hoff-harness` and `claude plugin install hoff-harness@hoff-harness`; the script is then `~/.claude/plugins/cache/hoff-harness/hoff-harness/*/skills/hoff-harness/scripts/hoff-harness`. If you are another agent (Cursor, Codex, Antigravity...): run `git clone https://github.com/rorosaga/hoff-harness ~/code/hoff-harness`, `mkdir -p ~/.agents/skills` and `ln -sfn ~/code/hoff-harness/skills/hoff-harness ~/.agents/skills/hoff-harness` (if you load skills from another folder, link it there too), then read its SKILL.md; the script is `~/code/hoff-harness/skills/hoff-harness/scripts/hoff-harness`. Make sure `uv` is installed. Run the script with `doctor`, explain any missing macOS permission and ask before requesting it. In Claude Code, offer the clip counter for my status line with `statusline install`. If browser-harness is installed, run it with `browser` to connect Chrome. Finally point at something in Finder: run it with `point --app Finder --find "Go" --say "Hi, I'm your guide cursor."`. If you can't run commands (the Claude app's chat, for example), tell me to paste this into Claude Code or the Claude app's Code tab instead.
+Install hoff-harness (https://github.com/rorosaga/hoff-harness), a second cursor for coding agents on macOS. If you are Claude Code: run `claude plugin marketplace add rorosaga/hoff-harness` and `claude plugin install hoff-harness@hoff-harness`; the script is then `~/.claude/plugins/cache/hoff-harness/hoff-harness/*/skills/hoff-harness/scripts/hoff-harness`. If you are another agent (Cursor, Codex, Antigravity...): run `git clone https://github.com/rorosaga/hoff-harness ~/code/hoff-harness`, `mkdir -p ~/.agents/skills` and `ln -sfn ~/code/hoff-harness/skills/hoff-harness ~/.agents/skills/hoff-harness` (if you load skills from another folder, link it there too), then read its SKILL.md; the script is `~/code/hoff-harness/skills/hoff-harness/scripts/hoff-harness`. Make sure `uv` is installed. Run the script with `doctor`, explain any missing macOS permission and ask before requesting it. In Claude Code, offer the clip counter for my status line with `statusline install`. If browser-harness is installed, run it with `browser` to connect Chrome. Finally point at something in Finder: run it with `point --app Finder --find "Go" --role MenuBarItem --activate --say "Hi, I'm your guide cursor."`. If you can't run commands (the Claude app's chat, for example), tell me to paste this into Claude Code or the Claude app's Code tab instead.
 ```
 
 Other agents and manual setup: [install.md](install.md).
@@ -51,10 +51,12 @@ agent (*"use cmd+shift for marking"*); they live in
 
 | Agent | Point, guide, do | Marks attach to your message | Tested |
 |---|---|---|---|
-| **Claude Code** (terminal, desktop app, IDEs) | ✓ | ✓ automatically (plugin hooks) | ✓ |
-| **Codex**, **Antigravity**, **OpenCode**, **Pi**, **Hermes** | ✓ through [SKILL.md](skills/hoff-harness/SKILL.md) | the agent runs `hoff-harness context` | not yet |
-| **Cursor** | ✓ finds the skill in `~/.claude/skills` | the agent runs `hoff-harness context` | ✓ |
-| **Claude desktop app** | ✓ through `hoff-harness mcp` ([install.md](install.md)) | the `marks` tool | connects ✓; pointing once uv has Accessibility |
+| **Claude Code** (terminal, IDEs) | ✓ | ✓ automatically (plugin hooks) | ✓ |
+| **Codex** | ✓ finds the skill in `~/.agents/skills` | the agent runs `hoff-harness context` | ✓ installed itself from the prompt above |
+| **Cursor** | ✓ finds the skill in `~/.agents/skills` or `~/.claude/skills` | the agent runs `hoff-harness context` | ✓ (allow it to run outside its sandbox) |
+| **Claude desktop app**, Code tab | ✓ it is Claude Code | ✓ | finds and runs the skill; needs Accessibility and Screen Recording for Claude |
+| **Claude desktop app**, chat | ✓ through `hoff-harness mcp` ([install.md](install.md)) | the `marks` tool | connects; needs Accessibility and Screen Recording for uv |
+| **Antigravity**, **OpenCode**, **Pi**, **Hermes** | ✓ through [SKILL.md](skills/hoff-harness/SKILL.md) | the agent runs `hoff-harness context` | not yet |
 | ChatGPT | only remote MCP servers | | not possible yet |
 
 ## Requirements

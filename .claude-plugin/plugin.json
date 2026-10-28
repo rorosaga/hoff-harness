@@ -1,6 +1,6 @@
 {
   "name": "hoff-harness",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A second cursor with a speech bubble that your agent drives on your Mac: it points, explains, walks you through steps or does them while you watch. Hold Control-Option to point at or circle something and ask about it.",
   "author": {
     "name": "rorosaga",
