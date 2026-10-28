@@ -1253,6 +1253,7 @@ class Marking:
             m["until"] = m["until"] or now + MARK_SHOWN + MARK_FADE
         for w in self.overlay.windows:
             w.setIgnoresMouseEvents_(True)
+        self.overlay.stack()
         threading.Thread(target=self.forget_screens, args=(self.shooting, list(self.saving)), daemon=True).start()
         self.saving = []
         self.overlay.repaint(time.monotonic(), everything=True)
@@ -1460,8 +1461,13 @@ class Overlay:
             w.orderFrontRegardless()
             self.windows.append(w)
             self.views.append(v)
+        self.stack()
+
+    def stack(self) -> None:
+        """The bubble over the rings and marks, the pointer over everything. A click while
+        marking raises the screen's window within the level, so this runs again after."""
         self.bubble[0].orderFrontRegardless()
-        self.pointer[0].orderFrontRegardless()  # over the ring and the bubble
+        self.pointer[0].orderFrontRegardless()
 
     # Everything drawn, in global top-left points, as one box: what to repaint.
     def box(self, now: float):
