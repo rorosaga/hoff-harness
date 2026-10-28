@@ -66,8 +66,10 @@ agent (*"use cmd+shift for marking"*); they live in
 - **[uv](https://docs.astral.sh/uv).** The first run installs PyObjC into uv's
   cache, which takes a few seconds.
 - **Accessibility** and **Screen Recording** permission for the app your agent
-  runs in (System Settings > Privacy & Security). `hoff-harness doctor` checks
-  both.
+  runs in: your terminal, Cursor, or the Claude app for its Code tab (System
+  Settings > Privacy & Security). `hoff-harness doctor` checks both,
+  `hoff-harness permissions` opens the right pages, and Claude Code tells you
+  at the start of a session when one is missing. Restart the app after.
 - Optional: **[browser-harness](https://github.com/browser-use/browser-harness)**
   for web pages in Chrome and other Chromium browsers.
 

@@ -146,6 +146,9 @@ click there and puts the person's pointer back where it was.
   that app forward, or pass `--activate` when switching to it is clearly what
   they want.
 - `5` the Mac is locked: tell the person, try nothing else.
+- `7` no Accessibility permission: tell the person which app needs it (the
+  message names it), offer to run `"$G" permissions`, and say they must restart
+  that app after allowing it.
 - `6` (`keys`) config.json is broken: fix it, the defaults are in use meanwhile.
 - `8` the person dismissed the guide during "do it for them": stop and ask.
 - `9` no Chrome page to work with: run `"$G" browser`, or `browser-harness --doctor`.
@@ -185,7 +188,9 @@ When the person wants different keys, edit `~/.config/hoff-harness/config.json`
 ## Notes
 
 - Needs macOS, `uv`, and Accessibility and Screen Recording permission for the
-  terminal app Claude Code runs in (System Settings > Privacy & Security).
+  app the agent runs in: the terminal, Cursor, or the Claude app (its Code tab).
+  `"$G" doctor` names the app. `"$G" permissions` opens the right System Settings
+  pages; ask the person before running it, since it shows macOS prompts.
 - Coordinates are screen points, origin at the top-left of the main display.
   Displays above or left of it have negative coordinates.
 - The overlay process starts on the first call (or at session start, with the

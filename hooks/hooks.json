@@ -5,7 +5,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/skills/hoff-harness/scripts/hoff-harness\" start >/dev/null 2>&1 || true",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/skills/hoff-harness/scripts/hoff-harness\" start 2>/dev/null || true",
             "timeout": 60
           }
         ]

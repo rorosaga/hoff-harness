@@ -2053,6 +2053,32 @@ def cmd_context(a) -> None:
     }))
 
 
+def missing_permissions() -> list[str]:
+    out = []
+    if not AX.AXIsProcessTrusted():
+        out.append("Accessibility")
+    if not Quartz.CGPreflightScreenCaptureAccess():
+        out.append("Screen Recording")
+    return out
+
+
+def cmd_permissions() -> None:
+    """Open System Settings where the missing permissions are given, with the app that
+    needs them already in the list. Only on the person's word: it shows macOS prompts."""
+    missing, host = missing_permissions(), permission_host()
+    if not missing:
+        print(f"{host} already has Accessibility and Screen Recording permission.")
+        return
+    if "Accessibility" in missing:
+        AX.AXIsProcessTrustedWithOptions({AX.kAXTrustedCheckOptionPrompt: True})  # adds the app to the list
+        subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
+    if "Screen Recording" in missing:
+        Quartz.CGRequestScreenCaptureAccess()
+        if "Accessibility" not in missing:
+            subprocess.run(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"])
+    print(f"Opened System Settings. Turn on {host} under {' and '.join(missing)}, then quit and reopen {host}.")
+
+
 def cmd_doctor() -> int:
     """What works, what is missing, and how to fix it. Exit 0 when the core works."""
     ok = True
@@ -2064,7 +2090,7 @@ def cmd_doctor() -> int:
 
     host = permission_host()
     line(AX.AXIsProcessTrusted(), "Accessibility permission",
-         f"System Settings > Privacy & Security > Accessibility: allow {host}, then restart it")
+         f"System Settings > Privacy & Security > Accessibility: allow {host}, then restart it (`hoff-harness permissions` opens it)")
     line(bool(Quartz.CGPreflightScreenCaptureAccess()), "Screen Recording permission (marks, screenshots)",
          f"System Settings > Privacy & Security > Screen Recording: allow {host}, then restart it")
     line(shutil.which("uv") is not None, "uv", "brew install uv  (or https://docs.astral.sh/uv)")
@@ -2253,7 +2279,7 @@ def main() -> None:
     if sys.argv[1:2] == ["_serve"]:
         serve()
         return
-    if sys.argv[1:2] not in (["hide"], ["quit"], ["keys"], ["context"], ["start"], ["doctor"], ["statusline"], ["mcp"], ["-h"], ["--help"]) and locked():
+    if sys.argv[1:2] not in (["hide"], ["quit"], ["keys"], ["context"], ["start"], ["doctor"], ["statusline"], ["mcp"], ["permissions"], ["-h"], ["--help"]) and locked():
         die("The Mac is locked. Nothing can be shown or read until the person unlocks it.", 5)
     p = argparse.ArgumentParser(prog="hoff-harness", description="A second cursor with a speech bubble that an agent drives.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2312,6 +2338,7 @@ def main() -> None:
     sub.add_parser("context", help="print what the person marked since the last prompt (for a UserPromptSubmit hook)")
     sub.add_parser("hide", help="put the cursor and bubble away")
     sub.add_parser("quit", help="stop the overlay process")
+    sub.add_parser("permissions", help="open System Settings where the missing permissions are given (ask the person first)")
     sub.add_parser("mcp", help="run as an MCP server over stdio (Claude Desktop, Cursor, other MCP apps)")
 
     a = p.parse_args()
@@ -2350,6 +2377,18 @@ def main() -> None:
             refresh_statusline()
         if not send({"cmd": "status"}):  # nobody answered: start one
             spawn()
+        missing = missing_permissions()
+        if missing:  # said at the start of the session, not at the first failed command
+            host = permission_host()
+            print(json.dumps({
+                "systemMessage": f"hoff-harness: {host} needs {' and '.join(missing)} permission for the guide cursor. "
+                                 f"Ask me to set it up, or run hoff-harness permissions.",
+                "hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext":
+                    f"hoff-harness cannot work yet: {host} lacks {' and '.join(missing)} permission. If the person asks "
+                    "for the guide cursor, explain this in a sentence and offer to run `hoff-harness permissions`, which "
+                    "opens the right System Settings pages. They must restart the app after allowing it."}}))
+    elif a.cmd == "permissions":
+        cmd_permissions()
     elif a.cmd == "context":
         cmd_context(a)
     elif a.cmd == "mcp":
