@@ -26,6 +26,7 @@ import fcntl
 import json
 import math
 import os
+import select
 import shutil
 import socket
 import subprocess
@@ -496,7 +497,9 @@ class Scene:
                     self.bubble = None
         x, y = self.move["end"]
         arrive = max(0.0, self.began + self.move["arrive"] - now)
-        return {"ok": True, "cursor": [round(x), round(y)], "arrive_in": round(arrive, 3), "shown": self.shown}
+        ax, ay = self.cursor(now)  # where it is this instant, mid-glide included
+        return {"ok": True, "cursor": [round(x), round(y)], "at": [round(ax, 1), round(ay, 1)],
+                "arrive_in": round(arrive, 3), "shown": self.shown, "talking": bool(self.bubble)}
 
     def tick(self, now: float) -> None:
         if self.bubble and self.bubble["until"] and now > self.bubble["until"]:
@@ -1941,7 +1944,9 @@ def cmd_context(a) -> None:
     # Claude Code also submits its own notices (a background task finished): the
     # marks wait for a message the person wrote.
     with contextlib.suppress(Exception):
-        if not sys.stdin.isatty():
+        # A hook pipes its input and closes it; anything else (a terminal, a script that
+        # leaves stdin open) gets no wait.
+        if not sys.stdin.isatty() and select.select([sys.stdin], [], [], 0.3)[0]:
             prompt = str(json.loads(sys.stdin.read() or "{}").get("prompt", ""))
             if "<task-notification>" in prompt or prompt.lstrip().startswith("<system-reminder>"):
                 return
