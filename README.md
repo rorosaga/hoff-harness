@@ -9,8 +9,8 @@ you watch. And you can point back: hold **⌃⌥**, circle something, and ask
 
 **[hoff.rorosaga.com](https://hoff.rorosaga.com)**: see it in action.
 
-**macOS only.** Works with Claude Code, Codex, Cursor, OpenCode, Pi, Hermes and
-other agents that can run shell commands.
+**macOS only.** Works with Claude Code, Cursor, the Claude desktop app (MCP), Codex,
+OpenCode, Pi, Hermes and other agents that can run shell commands.
 
 ## Install
 
@@ -52,8 +52,10 @@ agent (*"use cmd+shift for marking"*); they live in
 | Agent | Point, guide, do | Marks attach to your message | Tested |
 |---|---|---|---|
 | **Claude Code** (terminal, desktop app, IDEs) | ✓ | ✓ automatically (plugin hooks) | ✓ |
-| **Codex**, **Cursor**, **OpenCode**, **Pi**, **Hermes**, **Gemini CLI** | ✓ through [SKILL.md](skills/hoff-harness/SKILL.md) | the agent runs `hoff-harness context` | not yet |
-| Chat apps without a shell (Claude desktop chat, ChatGPT) | needs an MCP server | | planned |
+| **Codex**, **OpenCode**, **Pi**, **Hermes**, **Gemini CLI** | ✓ through [SKILL.md](skills/hoff-harness/SKILL.md) | the agent runs `hoff-harness context` | not yet |
+| **Cursor** | ✓ finds the skill in `~/.claude/skills` | the agent runs `hoff-harness context` | ✓ |
+| **Claude desktop app** | ✓ through `hoff-harness mcp` ([install.md](install.md)) | the `marks` tool | connects ✓; pointing once uv has Accessibility |
+| ChatGPT | only remote MCP servers | | not possible yet |
 
 ## Requirements
 

@@ -301,8 +301,8 @@ for `SessionStart` and `UserPromptSubmit`.
   format, that the agent can replay as a walkthrough or turn into automation. It
   is not the same as marking, where clicks must not reach the app ("what does
   Delete do?" must not delete).
-- **MCP server** (`hoff-harness-mcp`, like `browser-harness-mcp`) for apps
-  without a shell. `hoff_marks` would return the crop as an image.
+- **Remote MCP** for ChatGPT, which only connects to servers on the internet.
+  `hoff-harness mcp` (stdio) covers the Claude desktop app and Cursor.
 - **Rectangle clips:** shift-drag for a box instead of a freehand stroke.
 
 - **Circle to give context:**

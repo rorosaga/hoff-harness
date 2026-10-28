@@ -39,8 +39,34 @@ Give the agent [SKILL.md](skills/hoff-harness/SKILL.md) as instructions, the way
 it takes skills or rules. Marks are not attached for it automatically: it runs
 `hoff-harness context` when you say "this".
 
-Apps without a shell, such as the Claude desktop chat or ChatGPT, would need an
-MCP server. That isn't built yet.
+**Cursor** also finds the skill by itself in `~/.claude/skills`, so the symlink
+from the section above is enough. Its agent runs commands in a sandbox that can't
+use Accessibility; it asks to run hoff-harness outside the sandbox, and that's
+the run to allow.
+
+## Claude desktop app and other MCP apps
+
+`hoff-harness mcp` serves the same commands as MCP tools (`find`, `point`, `say`,
+`marks`, `shot`, `hide`). In `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "hoff-harness": {
+      "command": "/opt/homebrew/bin/uv",
+      "args": ["run", "--script", "--quiet", "/Users/YOU/.claude/skills/hoff-harness/scripts/hoff-harness", "mcp"]
+    }
+  }
+}
+```
+
+Use the full paths (`which uv`), then restart the app. macOS asks once whether
+**uv** may control the Mac: the desktop app starts the server through uv, so uv
+is what needs Accessibility and Screen Recording. Keep in mind that this covers
+anything else you run with uv.
+
+ChatGPT connects only to remote MCP servers, not to one on your Mac, so it can't
+use hoff-harness yet.
 
 ## Requirements
 

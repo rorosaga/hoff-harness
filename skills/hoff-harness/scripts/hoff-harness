@@ -307,7 +307,26 @@ def score(e: dict, query: str) -> float:
     return best
 
 
+def permission_host() -> str:
+    """Who macOS asks permission for: the terminal, or for MCP apps (Claude Desktop,
+    Cursor) the program that starts the server, which is uv."""
+    if os.environ.get("HOFF_MCP"):
+        return "uv (MCP apps start hoff-harness through it)"
+    pid = os.getppid()  # the first app up the process tree: Ghostty, Cursor, iTerm...
+    for _ in range(12):
+        out = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True).stdout.split(None, 1)
+        if len(out) < 2:
+            break
+        if ".app/" in out[1]:
+            return out[1].split(".app/")[0].rsplit("/", 1)[-1]
+        pid = int(out[0])
+    return os.environ.get("TERM_PROGRAM") or "the app running your agent"
+
+
 def find(app_name: str, query: str | None, role: str | None = None) -> tuple[object, list[dict]]:
+    if not AX.AXIsProcessTrusted():  # every app would look empty: say why instead
+        die(f"No Accessibility permission, so no app can be read. System Settings > Privacy & Security > "
+            f"Accessibility: allow {permission_host()}, then restart it.", 7)
     app = running_app(app_name)
     els = elements(app.processIdentifier())
     if role:
@@ -2040,7 +2059,7 @@ def cmd_doctor() -> int:
         print(f"[{'ok ' if good else ('FAIL' if needed else 'warn')}] {what}{'' if good or not fix else '  ->  ' + fix}")
         ok = ok and (good or not needed)
 
-    host = os.environ.get("TERM_PROGRAM") or "the app running your agent"
+    host = permission_host()
     line(AX.AXIsProcessTrusted(), "Accessibility permission",
          f"System Settings > Privacy & Security > Accessibility: allow {host}, then restart it")
     line(bool(Quartz.CGPreflightScreenCaptureAccess()), "Screen Recording permission (marks, screenshots)",
@@ -2117,11 +2136,121 @@ def locked() -> bool:
     return bool(info.get("CGSSessionScreenIsLocked"))
 
 
+# --- MCP: the same commands as tools, for apps that cannot run a shell -------------
+
+MCP_INSTRUCTIONS = """hoff-harness puts a second cursor with a speech bubble on the person's Mac screen.
+Use it to show where something is, explain what is on screen while pointing at it, walk
+them through a task one step at a time (point with wait_click and let them click), or do
+it for them while they watch (press or type). Find an element first with `find`, then
+`point` at it. Keep each bubble to one short sentence. Call `marks` at the start of a
+reply when the person may have circled or pointed at something with ctrl+option
+("this", "here", "that"): it returns what they marked, with pictures. Call `hide` when
+done. macOS only."""
+
+MCP_TOOLS = [
+    {"name": "find", "description": "List elements of a Mac app (accessibility tree) or of the front Chrome page, best match first, with their screen rects.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string", "description": "app name, e.g. Finder"},
+         "query": {"type": "string", "description": "text of the element; leave out to list the controls"},
+         "role": {"type": "string", "description": "e.g. Button, MenuItem, TextField"},
+         "web": {"type": "boolean", "description": "look in the front Chrome page instead"},
+         "css": {"type": "string", "description": "with web: a CSS selector"},
+         "limit": {"type": "integer"}}}},
+    {"name": "point", "description": "Glide the cursor to an element (app + find, a web element, or a rect) and say something in its bubble. wait_click returns once the person clicks it; press or type does it for them.",
+     "inputSchema": {"type": "object", "properties": {
+         "app": {"type": "string"}, "find": {"type": "string", "description": "text of the element in that app"},
+         "role": {"type": "string"}, "pick": {"type": "integer", "description": "which match of find, 0 is the best"},
+         "web": {"type": "string", "description": "an element on the front Chrome page, by what it says"},
+         "css": {"type": "string", "description": "an element on the front Chrome page, by CSS selector"},
+         "rect": {"type": "string", "description": "x,y,w,h in screen points"},
+         "at": {"type": "string", "description": "x,y in screen points"},
+         "say": {"type": "string", "description": "one short sentence for the bubble"},
+         "title": {"type": "string", "description": "a small heading over it, e.g. Step 1 of 3"},
+         "hold": {"type": "string", "description": "seconds to wait before returning, or auto"},
+         "wait_click": {"type": "boolean"}, "timeout": {"type": "number"},
+         "press": {"type": "boolean", "description": "do it for them: press the target"},
+         "type": {"type": "string", "description": "do it for them: type this into the target"},
+         "enter": {"type": "boolean", "description": "with type: press Return after"},
+         "activate": {"type": "boolean", "description": "bring the app to the front first"}}}},
+    {"name": "say", "description": "Change what the bubble says, where the cursor is.",
+     "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "title": {"type": "string"}, "hold": {"type": "string"}},
+                     "required": ["text"]}},
+    {"name": "marks", "description": "What the person marked on screen with ctrl+option since the last call: the app, the elements and text under each mark, and a picture of it. Empty when nothing was marked.",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "shot", "description": "A screenshot, one pixel per screen point, of the main display or one app's front window.",
+     "inputSchema": {"type": "object", "properties": {"app": {"type": "string"}}}},
+    {"name": "hide", "description": "Put the cursor and the bubble away.", "inputSchema": {"type": "object", "properties": {}}},
+]
+
+
+def mcp_call(name: str, args: dict) -> tuple[list, bool]:
+    """Run one tool as the CLI command it stands for; its output (and any pictures it
+    names) becomes the tool's result."""
+    me = [sys.executable, os.path.abspath(__file__)]
+    if name == "marks":
+        r = subprocess.run([*me, "context"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        out = r.stdout.strip()
+        text = json.loads(out)["hookSpecificOutput"]["additionalContext"] if out.startswith("{") else "Nothing marked."
+        return mcp_content(text), False
+    flags = {"say": ["text"], "find": ["query"]}.get(name, [])
+    argv = [name] + [str(args[k]) for k in flags if k in args]
+    for k, v in args.items():
+        if k in flags or v in (None, False, ""):
+            continue
+        flag = "--" + k.replace("_", "-")
+        argv += [flag] if v is True else [flag, str(v)]
+    r = subprocess.run([*me, *argv], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=float(args.get("timeout") or 100) + 30)
+    return mcp_content((r.stdout + r.stderr).strip() or "done"), r.returncode != 0
+
+
+def mcp_content(text: str) -> list:
+    import base64
+    content = [{"type": "text", "text": text}]
+    for word in text.split():
+        if word.endswith(".png") and os.path.isfile(word):
+            with open(word, "rb") as f:
+                content.append({"type": "image", "mimeType": "image/png", "data": base64.b64encode(f.read()).decode()})
+    return content
+
+
+def cmd_mcp() -> None:
+    """A stdio MCP server (JSON-RPC, one message per line) for Claude Desktop, Cursor and
+    other MCP clients. It starts the overlay, so marking works while the app is open."""
+    os.environ["HOFF_MCP"] = "1"  # its commands name the right program in permission messages
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "start"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for line in sys.stdin:
+        with contextlib.suppress(ValueError):
+            msg = json.loads(line)
+            if "id" not in msg:
+                continue  # a notification: nothing to answer
+            method, params = msg.get("method"), msg.get("params") or {}
+            if method == "initialize":
+                result = {"protocolVersion": params.get("protocolVersion", "2025-06-18"),
+                          "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "hoff-harness", "version": "0.1"},
+                          "instructions": MCP_INSTRUCTIONS}
+            elif method == "tools/list":
+                result = {"tools": MCP_TOOLS}
+            elif method == "tools/call":
+                try:
+                    content, failed = mcp_call(params["name"], params.get("arguments") or {})
+                except Exception as e:  # a tool that breaks answers with why, the server stays up
+                    content, failed = [{"type": "text", "text": f"{type(e).__name__}: {e}"}], True
+                result = {"content": content, "isError": failed}
+            elif method == "ping":
+                result = {}
+            else:
+                print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "error": {"code": -32601, "message": f"no method {method}"}}), flush=True)
+                continue
+            print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+
+
 def main() -> None:
     if sys.argv[1:2] == ["_serve"]:
         serve()
         return
-    if sys.argv[1:2] not in (["hide"], ["quit"], ["keys"], ["context"], ["start"], ["doctor"], ["statusline"], ["-h"], ["--help"]) and locked():
+    if sys.argv[1:2] not in (["hide"], ["quit"], ["keys"], ["context"], ["start"], ["doctor"], ["statusline"], ["mcp"], ["-h"], ["--help"]) and locked():
         die("The Mac is locked. Nothing can be shown or read until the person unlocks it.", 5)
     p = argparse.ArgumentParser(prog="hoff-harness", description="A second cursor with a speech bubble that an agent drives.")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -2180,6 +2309,7 @@ def main() -> None:
     sub.add_parser("context", help="print what the person marked since the last prompt (for a UserPromptSubmit hook)")
     sub.add_parser("hide", help="put the cursor and bubble away")
     sub.add_parser("quit", help="stop the overlay process")
+    sub.add_parser("mcp", help="run as an MCP server over stdio (Claude Desktop, Cursor, other MCP apps)")
 
     a = p.parse_args()
     if a.cmd == "find":
@@ -2219,6 +2349,8 @@ def main() -> None:
             spawn()
     elif a.cmd == "context":
         cmd_context(a)
+    elif a.cmd == "mcp":
+        cmd_mcp()
     elif a.cmd == "keys":
         conf = load_config()
         if conf.get("error"):
