@@ -1292,6 +1292,7 @@ class Marking:
         for w in self.overlay.windows:
             w.setIgnoresMouseEvents_(False)
             w.setAcceptsMouseMovedEvents_(True)
+        self.overlay.order(time.monotonic())
         self.overlay.repaint(time.monotonic(), everything=True)
 
     def leave(self) -> None:
@@ -1494,6 +1495,7 @@ class Overlay:
         self.pointer = pointer_panel()
         self.bubble = bubble_panel()
         self.look = None  # the (shape, press, blur) the pointer picture shows
+        self.up = {"screens": False, "bubble": False, "pointer": False}  # which windows are on screen
         self.conf, self.conf_stamp = load_config(), None
         write_keys_hint(self.conf)
         self.marking = Marking(self)
@@ -1506,20 +1508,48 @@ class Overlay:
         for w in self.windows:
             w.orderOut_(None)
         self.windows, self.views, self.layout = [], [], now_layout
+        self.up["screens"] = False
         for s in AppKit.NSScreen.screens():
             w = click_through_panel(s.frame())
             v = GuideView.alloc().initWithFrame_(((0, 0), s.frame().size))
             w.setContentView_(v)
-            w.orderFrontRegardless()
             self.windows.append(w)
             self.views.append(v)
-        self.stack()
+        self.order(time.monotonic())
+
+    def order(self, now: float) -> None:
+        """Windows are on screen only while they show something. Clear as they are, a
+        full-screen window still sits over every app, and tools that check what is under
+        a point before they click see it there and refuse."""
+        sc, marking = self.scene, self.marking
+        shown = sc.alpha(now) > 0.001
+        want = {
+            "screens": marking.active or bool(marking.marks or marking.pulses or marking.stroke)
+                       or (shown and bool(sc.ring)),
+            "bubble": shown and bool(sc.bubble),
+            "pointer": shown,
+        }
+        if want == self.up:
+            return
+        raised = want["screens"] and not self.up["screens"]  # then the bubble and pointer go back over them
+        if raised:
+            for v in self.views:  # nothing old for a frame
+                v.setNeedsDisplay_(True)
+        for name, windows in (("screens", self.windows), ("bubble", [self.bubble[0]]), ("pointer", [self.pointer[0]])):
+            if not want[name]:
+                for w in windows:
+                    w.orderOut_(None)
+            elif not self.up[name] or raised:
+                for w in windows:
+                    w.orderFrontRegardless()
+        self.up = want
 
     def stack(self) -> None:
         """The bubble over the rings and marks, the pointer over everything. A click while
         marking raises the screen's window within the level, so this runs again after."""
-        self.bubble[0].orderFrontRegardless()
-        self.pointer[0].orderFrontRegardless()
+        for name in ("bubble", "pointer"):
+            if self.up[name]:
+                getattr(self, name)[0].orderFrontRegardless()
 
     # Everything drawn, in global top-left points, as one box: what to repaint.
     def box(self, now: float):
@@ -1563,6 +1593,7 @@ class Overlay:
         reply = self.scene.command(c, now, calm)
         if conf.get("error"):
             reply["config_error"] = conf["error"]
+        self.order(now)
         self.repaint(now, everything=True)
         self.schedule(0)
         if c["cmd"] == "quit":
@@ -1584,6 +1615,7 @@ class Overlay:
         if not self.conf["marks"] and not sc.shown and sc.alpha(now) <= 0 and now - sc.touched > IDLE_HIDDEN:
             AppKit.NSApp.terminate_(None)
         busy = sc.busy(now) or marking.busy(now)
+        self.order(now)
         self.place_pointer(now)
         self.place_bubble(now)
         self.repaint(now, everything=marking.busy(now))
